@@ -28,6 +28,8 @@ export type Node = {
   name: string
   public: boolean
   online: boolean
+  /** Panel only. This running agent has self-updates enabled. */
+  can_upgrade?: boolean
   // Seconds since the last report on the hub's clock, null for a node never
   // seen. The hub also sends the timestamp, which the panel leaves alone:
   // against this browser's clock it is off by as much as that clock is.

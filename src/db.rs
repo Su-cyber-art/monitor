@@ -220,6 +220,16 @@ CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_upgrade (
+  node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  message TEXT NOT NULL DEFAULT '',
+  started_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
@@ -236,7 +246,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -413,6 +423,18 @@ fn migrate_to_13(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
 }
 
+fn migrate_to_14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_upgrade (
+           node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+           id TEXT NOT NULL, version TEXT NOT NULL, status TEXT NOT NULL,
+           message TEXT NOT NULL DEFAULT '',
+           started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -465,13 +487,16 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 13 {
         migrate_to_13(&tx)?;
     }
+    if from < 14 {
+        migrate_to_14(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
 /// Every table this build keeps.
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 11] = [
     "setting",
     "node",
     "traffic",
@@ -482,11 +507,11 @@ const TABLES: [&str; 10] = [
     "session",
     "metric_hour",
     "ping_hour",
+    "agent_upgrade",
 ];
 
-/// The tables `migrate_to_11` adds. A backup taken before it lacks them and is
-/// still a backup this build restores.
-const HOURLY_TABLES: [&str; 2] = ["metric_hour", "ping_hour"];
+/// Tables added after v1.0.0. The migrations create them when restoring an old backup.
+const ADDED_TABLES: [&str; 3] = ["metric_hour", "ping_hour", "agent_upgrade"];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -2511,9 +2536,8 @@ impl Db {
         if plotted > 0 {
             refuse!("文件里有视图或触发器，不是 hub 导出的备份");
         }
-        // The hourly tables are created by the migration below; their columns are
-        // compared with the rest once it has run.
-        for table in TABLES.iter().filter(|t| !HOURLY_TABLES.contains(t)) {
+        // Tables added by migrations are checked with the rest after migrating.
+        for table in TABLES.iter().filter(|t| !ADDED_TABLES.contains(t)) {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -2595,6 +2619,75 @@ impl Db {
                 warn!("keeping the {table} id high mark across the restore failed: {e:#}");
             }
         }
+        Ok(())
+    }
+
+    // ---- agent upgrades ----
+
+    pub fn agent_upgrades(&self) -> Result<Vec<crate::upgrade::Attempt>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, id, version, status, message, started_at, updated_at
+             FROM agent_upgrade ORDER BY started_at DESC, node_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::upgrade::Attempt {
+                    node_id: r.get(0)?,
+                    id: r.get(1)?,
+                    version: r.get(2)?,
+                    status: r.get(3)?,
+                    message: r.get(4)?,
+                    started_at: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One attempt per node. A second click cannot replace an upgrade in flight.
+    pub fn start_agent_upgrade(&self, node: i64, id: &str, version: &str, now: i64) -> Result<bool> {
+        Ok(self.conn().execute(
+            "INSERT INTO agent_upgrade (node_id, id, version, status, started_at, updated_at)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?4)
+             ON CONFLICT(node_id) DO UPDATE SET id=excluded.id, version=excluded.version,
+               status='queued', message='', started_at=excluded.started_at, updated_at=excluded.updated_at
+             WHERE agent_upgrade.status IN ('succeeded', 'failed')",
+            params![node, id, version, now],
+        )? > 0)
+    }
+
+    pub fn agent_upgrade_progress(&self, node: i64, id: &str, status: &str, message: &str) -> Result<()> {
+        // Progress can only advance. A late frame from a retired connection must
+        // neither revive a finished attempt nor overwrite a newer request.
+        self.conn().execute(
+            "UPDATE agent_upgrade SET status=?3, message=?4, updated_at=?5
+             WHERE node_id=?1 AND id=?2 AND (
+               (?3='downloading' AND status='queued') OR
+               (?3='restarting' AND status IN ('queued', 'downloading')) OR
+               (?3='failed' AND status IN ('queued', 'downloading', 'restarting')))",
+            params![node, id, status, message, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Completion requires the requested version in a new process's hello.
+    pub fn complete_agent_upgrade(&self, node: i64, id: &str, version: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agent_upgrade SET status='succeeded', message='', updated_at=?4
+             WHERE node_id=?1 AND id=?2 AND version=?3",
+            params![node, id, version, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn expire_agent_upgrades(&self, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agent_upgrade SET status='failed', message='升级超时，未收到新版本的连接确认', updated_at=?1
+             WHERE status IN ('queued', 'downloading', 'restarting') AND started_at<=?2",
+            params![now, now - crate::upgrade::TIMEOUT],
+        )?;
         Ok(())
     }
 
@@ -4154,7 +4247,7 @@ mod tests {
         // One row per table, plus the id high marks `open` records.
         assert_eq!(
             upgraded.len(),
-            TABLES.len() - HOURLY_TABLES.len() + ID_TABLES.len(),
+            TABLES.len() - ADDED_TABLES.len() + ID_TABLES.len(),
             "every row survives: {upgraded:#?}"
         );
 

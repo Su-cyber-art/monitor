@@ -86,6 +86,8 @@ pub struct Agent {
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
     pub last_seen: i64,
+    /// The installed agent explicitly enabled self-updates in its hello.
+    pub can_upgrade: bool,
     /// The wall-clock minute this session last wrote a history row for, or the
     /// one it opened in. A row is written when a report arrives past it.
     ///
@@ -111,6 +113,7 @@ impl Agent {
             tx,
             metrics: serde_json::Value::Null,
             last_seen: 0,
+            can_upgrade: false,
             last_minute: None,
             mark: None,
             minute: Minute::default(),
@@ -420,7 +423,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     let outcome = loop {
         tokio::select! {
             outbound = rx.recv() => match outbound {
-                Some(text) => socket.send(Message::Text(text.into())).await?,
+                Some(text) => {
+                    if let Err(e) = socket.send(Message::Text(text.into())).await {
+                        break Err(e.into());
+                    }
+                },
                 None => break Ok(()),
             },
             // A machine that leaves the network without closing its socket would
@@ -447,7 +454,9 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                         Err(e) => debug!("node {node_id}: country check failed: {e:#}"),
                     }
                 }
-                socket.send(Message::Ping(Vec::new().into())).await?;
+                if let Err(e) = socket.send(Message::Ping(Vec::new().into())).await {
+                    break Err(e.into());
+                }
             }
             inbound = socket.recv() => {
                 last_frame = Instant::now();
@@ -560,6 +569,7 @@ fn dispatch(
             debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
         }
         "report" => report(app, node_id, rpc.params, arrival)?,
+        "upgrade.result" => crate::upgrade::progress(app, node_id, rpc.params)?,
         "ping.result" if !session.admit_result(arrival.tick) => session.complain(
             node_id,
             format_args!(
@@ -587,7 +597,14 @@ fn dispatch(
 fn save_facts(app: &App, node_id: i64, ip: &str, facts: &serde_json::Value) -> Result<Option<String>> {
     let field = |k: &str| facts.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let source = country_source(ip, field("ipv4"), field("ipv6")).map_or_else(String::new, |a| a.to_string());
-    Ok(app.db.save_facts(node_id, facts, ip, &source)?.then_some(source))
+    let changed = app.db.save_facts(node_id, facts, ip, &source)?;
+    if let Some(id) = facts.get("upgrade_id").and_then(|v| v.as_str()) {
+        app.db.complete_agent_upgrade(node_id, id, field("agent_version"))?;
+    }
+    if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
+        agent.can_upgrade = facts.get("can_upgrade").and_then(|v| v.as_bool()) == Some(true);
+    }
+    Ok(changed.then_some(source))
 }
 
 /// Globally routable. Excluded on the v4 side: RFC 1918, CGNAT (100.64/10),

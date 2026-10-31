@@ -302,6 +302,7 @@ fn node_view(
     // Address and private notes never leave the panel. The token is not here at
     // all: the panel reads it from `node_token` as it shows the install command.
     if full {
+        view["can_upgrade"] = json!(current.is_some_and(|agent| agent.can_upgrade));
         let held = (node.ipv4.as_str(), node.ipv6.as_str());
         let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
         let exits = [node.ip.as_str(), node.ip_other.as_str()];
@@ -3000,8 +3001,17 @@ mod tests {
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "addresses", "ipv4_auto", "ipv6_auto", "remark", "hostname", "token", "interval"]
-        {
+        for hidden in [
+            "ip",
+            "addresses",
+            "ipv4_auto",
+            "ipv6_auto",
+            "remark",
+            "hostname",
+            "token",
+            "interval",
+            "can_upgrade",
+        ] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(

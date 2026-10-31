@@ -1,10 +1,10 @@
 [package]
 name = "monitor-hub"
-version = "1.5.1"
+version = "1.6.0"
 edition = "2021"
 license = "MIT"
 description = "Lightweight server monitoring hub"
-repository = "https://github.com/monitor-probe/monitor"
+repository = "https://github.com/Su-cyber-art/monitor"
 
 [dependencies]
 anyhow = "1"
@@ -46,9 +46,9 @@ rustix = { version = "1", features = ["process", "net"] }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
-# Only the tests need a movable clock; the relay deadline spans minutes.
+# Tests move the relay clock and launch real agents for upgrade verification.
 # dev-dependencies do not reach the shipped binary.
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["test-util", "process"] }
 
 [profile.release]
 codegen-units = 1

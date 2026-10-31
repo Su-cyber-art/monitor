@@ -14,6 +14,7 @@ PATH="$PATH:/usr/sbin:/sbin"
 # single path to inspect and a single path to remove.
 ROOT="/opt/monitor"
 BIN="$ROOT/monitor-agent"
+AGENT_DIR="$ROOT/agent"
 ENV_FILE="$ROOT/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
@@ -65,6 +66,10 @@ if [ -n "$UNINSTALL" ]; then
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
 	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
+	rm -f "$AGENT_DIR/monitor-agent" "$AGENT_DIR/monitor-agent.previous" \
+		"$AGENT_DIR/monitor-agent.backup" "$AGENT_DIR/monitor-agent.download" \
+		"$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp"
+	rmdir "$AGENT_DIR" 2>/dev/null || true
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
@@ -254,7 +259,8 @@ esac
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+STAGED_BIN="$ROOT/.monitor-agent.install.$$"
+trap 'rm -f "$TMP" "$STAGED_BIN"' EXIT
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -396,11 +402,24 @@ else
 	}
 fi
 install -d -m 0755 "$ROOT"
+# This user can replace its own executable, but cannot write the hub, the
+# root-only env file, or a service definition. current_exe() resolves through
+# the root-owned symlink at the documented binary path into this directory.
+install -d -m 0755 "$AGENT_DIR"
+chown monitor-agent "$AGENT_DIR"
 # Kept until the new binary has proved it starts; see not_started. Never over
 # an existing copy: a run that died before that check left an unproven binary
 # in $BIN, and the copy is the one that ran before it.
 [ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
-install -m 0755 "$TMP" "$BIN"
+# Set ownership under the root-owned parent, then publish without following a
+# destination symlink in the agent's writable directory.
+install -m 0755 "$TMP" "$STAGED_BIN"
+chown monitor-agent "$STAGED_BIN"
+mv -fT "$STAGED_BIN" "$AGENT_DIR/monitor-agent"
+# A manual install supersedes any interrupted self-update.
+rm -f "$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp" \
+	"$AGENT_DIR/monitor-agent.previous" "$AGENT_DIR/monitor-agent.backup" "$AGENT_DIR/monitor-agent.download"
+ln -sfn "$AGENT_DIR/monitor-agent" "$BIN"
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -412,6 +431,7 @@ install -m 0755 "$TMP" "$BIN"
 	cat >"$ENV_FILE" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
+MONITOR_ALLOW_UPGRADE=1
 ENV
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
@@ -423,7 +443,7 @@ ENV
 not_started() {
 	echo "monitor-agent did not start; see: $1" >&2
 	[ -f "$BIN.old" ] || exit 1
-	mv -f "$BIN.old" "$BIN"
+	mv -fT "$BIN.old" "$BIN"
 	if [ "$INIT" = openrc ]; then
 		rc-service monitor-agent restart >/dev/null 2>&1 || true
 	else
@@ -495,6 +515,7 @@ User=monitor-agent
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
 ProtectSystem=strict
+ReadWritePaths=$AGENT_DIR
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

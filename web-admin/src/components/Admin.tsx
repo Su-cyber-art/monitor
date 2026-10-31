@@ -3508,7 +3508,7 @@ function Data() {
   )
 }
 
-const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
+const releaseUrl = (repo: string, version: string) => `https://github.com/Su-cyber-art/${repo}/releases/tag/v${version}`
 
 /** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
 function VersionPair({ current, latest }: { current: string; latest: string }) {
@@ -3538,6 +3538,124 @@ function byVersion(nodes: Node[]): [string, Node[]][] {
  * The hub card names the release alone: how to take it depends on how the hub
  * was installed, script or container, which the hub cannot tell.
  */
+type AgentUpgrade = {
+  node_id: number
+  id: string
+  version: string
+  status: "queued" | "downloading" | "restarting" | "succeeded" | "failed"
+  message: string
+  started_at: number
+  updated_at: number
+}
+
+const UPGRADE_LABELS = { queued: "等待响应", downloading: "下载中", restarting: "重启并确认版本", succeeded: "升级成功", failed: "升级失败" }
+const upgradeRunning = (job: AgentUpgrade) => !["succeeded", "failed"].includes(job.status)
+
+function AgentUpgrades({ nodes, latest }: { nodes: Node[]; latest: string }) {
+  const [jobs, setJobs] = useState<AgentUpgrade[]>([])
+  const [error, setError] = useState("")
+  const [typedTarget, setTarget] = useState<string | null>(null)
+  const target = typedTarget ?? latest
+  const [open, setOpen] = useState(false)
+  const [chosen, setChosen] = useState(new Set<number>())
+  const [busy, setBusy] = useState(false)
+  const revision = useRef(0)
+  const load = useCallback(() => {
+    const request = ++revision.current
+    return api<{ upgrades: AgentUpgrade[] }>("/agent-upgrades")
+      .then((data) => { if (request === revision.current) { setJobs(data.upgrades); setError("") } })
+      .catch((e: Error) => { if (request === revision.current) setError(e.message) })
+  }, [])
+  useEffect(() => { load() }, [load])
+  const running = jobs.some(upgradeRunning)
+  useEffect(() => {
+    if (!running) return
+    const timer = setInterval(load, 2000)
+    return () => clearInterval(timer)
+  }, [running, load])
+
+  const activeIds = new Set(jobs.filter(upgradeRunning).map((job) => job.node_id))
+  const eligible = outdatedAgents(nodes, target.trim()).filter((node) => node.online && node.can_upgrade && !activeIds.has(node.id))
+  const selected = eligible.filter((node) => chosen.has(node.id))
+  const visibleJobs = jobs.filter((job) => nodes.some((node) => node.id === job.node_id))
+
+  async function start() {
+    setBusy(true)
+    ++revision.current
+    try {
+      const data = await api<{ started: number; upgrades: AgentUpgrade[] }>("/agent-upgrades", {
+        method: "POST", body: JSON.stringify({ ids: selected.map((node) => node.id), version: target.trim() }),
+      })
+      ++revision.current
+      setJobs(data.upgrades)
+      setError("")
+      setOpen(false)
+      if (data.started) toast.success(`已向 ${data.started} 台节点下发升级，请查看每台节点的结果`)
+      else toast.error("没有节点接受升级，请查看结果中的原因")
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="agent-upgrade-version">目标版本</Label>
+          <Input id="agent-upgrade-version" className="w-40" placeholder="例如 1.3.0" value={target} disabled={busy || open} onChange={(event) => setTarget(event.target.value)} />
+        </div>
+        <Button disabled={!eligible.length || busy || !target.trim()} onClick={() => { setChosen(new Set(eligible.map((node) => node.id))); setOpen(true) }}>
+          <ArrowUpCircle /> 批量升级{eligible.length > 0 && `（${eligible.length} 台可选）`}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={load}><RefreshCw /> 刷新结果</Button>
+      </div>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        选择在线节点后统一升级，沿用每台机器的 token、网卡和上报间隔。下载期间继续监控，切换版本时短暂重连；新版本连接主控后才显示成功。
+        {!latest && " 暂时查不到最新版本，可填写已发布的版本号。"}
+      </p>
+      {error && <p className="text-sm text-destructive" role="alert">升级结果加载失败：{error}</p>}
+      {visibleJobs.length > 0 && (
+        <div className="overflow-x-auto rounded-md border">
+          <Table>
+            <TableHeader><TableRow><TableHead>节点</TableHead><TableHead>目标版本</TableHead><TableHead>状态</TableHead><TableHead>说明</TableHead></TableRow></TableHeader>
+            <TableBody>
+              {visibleJobs.map((job) => (
+                <TableRow key={job.node_id}>
+                  <TableCell className="font-medium">{nodes.find((node) => node.id === job.node_id)!.name}</TableCell>
+                  <TableCell>v{job.version}</TableCell>
+                  <TableCell><Badge variant={job.status === "failed" ? "destructive" : "secondary"}>{UPGRADE_LABELS[job.status]}</Badge></TableCell>
+                  <TableCell className="max-w-80 whitespace-normal text-xs text-muted-foreground">{job.message || (job.status === "succeeded" ? "已收到目标版本的连接确认" : "—")}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+      {open && (
+        <Dialog open onOpenChange={(next) => { if (!next && !busy) setOpen(false) }}>
+          <DialogContent className="sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>批量升级 agent 到 v{target.trim()}</DialogTitle>
+              <DialogDescription>已选 {selected.length} 台节点。升级会短暂断开监控连接；下载或校验失败时保留原版本，切换后无法连接主控时恢复原版本。</DialogDescription>
+            </DialogHeader>
+            <NodePicker nodes={eligible} chosen={chosen} disabled={busy} onPick={(list, on) => setChosen((previous) => {
+              const next = new Set(previous)
+              for (const node of list) { if (on) next.add(node.id); else next.delete(node.id) }
+              return next
+            })} />
+            <DialogFooter>
+              <Button variant="outline" disabled={busy} onClick={() => setOpen(false)}>取消</Button>
+              <Button disabled={busy || !selected.length} onClick={start}>{busy ? "正在下发…" : `开始升级（${selected.length} 台）`}</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+    </div>
+  )
+}
+
 function Update({ versions, reload, nodes, site, refusal }: {
   versions: Versions | null
   reload: () => void
@@ -3548,6 +3666,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
   const [saving, setSaving] = useState(false)
   if (!versions) return null
   const outdated = outdatedAgents(nodes, versions.agent_latest)
+  const bootstrap = outdated.filter((node) => !node.can_upgrade)
   const offline = outdated.filter((n) => !n.online).length
   const upgrade = refusal ? "" : upgradeCommand(site)
   const unreachable = !versions.hub_latest && !versions.agent_latest
@@ -3602,12 +3721,11 @@ function Update({ versions, reload, nodes, site, refusal }: {
               : "查不到版本"}
           </span>
         </div>
-        {/* Also where the lookup failed: the command does not depend on it, and a
-            hub that fetches agents through the GitHub proxy cannot read tags. */}
-        {(outdated.length > 0 || !versions.agent_latest) && (
+        <AgentUpgrades nodes={nodes} latest={versions.agent_latest} />
+        {(bootstrap.length > 0 || !versions.agent_latest) && (
           <>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              以 root 在每台机器上执行一次。不含凭证，沿用机器上已有的设置，不会新建节点。
+              旧版 agent 首次接入：用新版安装脚本更新一次，启用远程升级。下面的命令不含凭证，沿用机器上已有的设置，不会新建节点；之后可直接在本页批量升级。
             </p>
             {upgrade ? (
               <>

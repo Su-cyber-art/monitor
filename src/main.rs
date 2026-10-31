@@ -30,6 +30,9 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod upgrade;
+#[cfg(test)]
+mod upgrade_e2e;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -37,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -165,8 +168,8 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// Where the agent binaries are published, and where this hub is published. Not
 /// settings: redirecting either implies a fork, which rebuilds these lines
 /// anyway.
-pub const AGENT_REPO: &str = "monitor-probe/agent";
-pub const HUB_REPO: &str = "monitor-probe/monitor";
+pub const AGENT_REPO: &str = "Su-cyber-art/agent";
+pub const HUB_REPO: &str = "Su-cyber-art/monitor";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -182,12 +185,11 @@ async fn install_script() -> Response {
 /// path. It remains within the bounds `agent_binary` already enforces: four
 /// concurrent transfers, a response within [`RELAY_HEAD`], a capped body and a
 /// signature.
-fn release_url(app: &App, arch: &str) -> String {
+fn release_url(app: &App, arch: &str, version: Option<&str>) -> String {
+    let release = version.map_or_else(|| "latest/download".to_owned(), |v| format!("download/v{v}"));
     proxied(
         app,
-        format!(
-            "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
-        ),
+        format!("https://github.com/{AGENT_REPO}/releases/{release}/monitor-agent-{arch}-unknown-linux-musl"),
     )
 }
 
@@ -285,8 +287,8 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 /// The key the agent's release job signs each binary with (ed25519, the raw 32
 /// bytes). Rotating it takes a hub release.
 const AGENT_SIGNING_KEY: [u8; 32] = [
-    0x9a, 0x7c, 0x5e, 0x29, 0xf8, 0x79, 0x5a, 0x0a, 0x72, 0x12, 0x3e, 0xe1, 0xf0, 0x6a, 0x93, 0x41, 0xf2,
-    0x95, 0x34, 0xdb, 0xc2, 0x85, 0xb9, 0xab, 0xbe, 0xe6, 0xa0, 0x06, 0xdc, 0x65, 0xee, 0xef,
+    0x4c, 0x65, 0x52, 0x1f, 0x84, 0x44, 0x91, 0xc2, 0x92, 0xe4, 0x9a, 0xc4, 0xab, 0xf6, 0x57, 0xc3, 0xfb,
+    0x53, 0x07, 0xbf, 0xad, 0x0d, 0x1f, 0x1a, 0x8d, 0xf3, 0xe7, 0x87, 0xa4, 0x8f, 0xf3, 0x42,
 ];
 
 /// Far above the 1.8 MB an agent weighs; bounds what a proxy can make the hub
@@ -369,15 +371,31 @@ impl futures_core::Stream for Once {
 /// fetched from the same place: a mirror can withhold or replace either, but
 /// cannot produce a signature that verifies. The key is the hub's, not the
 /// release's, so an agent release needs no hub release.
-async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
+#[derive(serde::Deserialize)]
+struct AgentRelease {
+    version: Option<String>,
+}
+
+async fn agent_binary(
+    State(app): State<Shared>,
+    Path(arch): Path<String>,
+    Query(release): Query<AgentRelease>,
+) -> Response {
+    relay_agent(app, arch, release, &AGENT_SIGNING_KEY).await
+}
+
+async fn relay_agent(app: Shared, arch: String, release: AgentRelease, signing_key: &[u8]) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
+    }
+    if release.version.as_deref().is_some_and(|version| !upgrade::valid_version(version)) {
+        return api::answer(StatusCode::BAD_REQUEST, "invalid agent version");
     }
     let asked = tokio::time::Instant::now();
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
         return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
     };
-    let url = release_url(&app, &arch);
+    let url = release_url(&app, &arch, release.version.as_deref());
     let sig = format!("{url}.sig");
     // English, as `install.sh` prints it after its own English line.
     let fetched = async {
@@ -385,7 +403,7 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
             fetch_asset(&app, &url, "agent binary", MAX_AGENT_BINARY),
             fetch_asset(&app, &sig, "agent signature", 64),
         )?;
-        if !relayable(&AGENT_SIGNING_KEY, &binary, &signature, &arch) {
+        if !relayable(signing_key, &binary, &signature, &arch) {
             warn!("{url} does not match its signature or architecture; not relayed");
             return Err(
                 "the agent binary failed its signature check, so the hub refused to relay it".to_owned()
@@ -649,6 +667,7 @@ async fn main() -> Result<()> {
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/version", get(api::versions))
+        .route("/api/agent-upgrades", get(upgrade::list).post(upgrade::start))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
@@ -749,6 +768,7 @@ async fn serve(listener: tokio::net::TcpListener, router: Router) {
         // its response on a closed window and hold the descriptor indefinitely.
         // The kernel aborts a window that stays closed, or data that nobody
         // acknowledges, after this long.
+        #[cfg(target_os = "linux")]
         let _ = rustix::net::sockopt::set_tcp_user_timeout(&stream, STALL.as_millis() as u32);
         let service = router.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
             req.extensions_mut().insert(ConnectInfo(peer));
@@ -777,6 +797,7 @@ async fn serve(listener: tokio::net::TcpListener, router: Router) {
 /// How long the peer's receive window may stay shut, or data go unacknowledged,
 /// before the kernel drops the connection. The push stream gives up on a send
 /// after 10 s of its own; this bounds the rest.
+#[cfg(target_os = "linux")]
 const STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a stop waits for in-flight requests.
@@ -1410,17 +1431,19 @@ mod tests {
     #[test]
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
-        let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/monitor-probe/agent/releases/"), "{direct}");
+        let direct = release_url(&app, "x86_64", None);
+        assert!(direct.starts_with("https://github.com/Su-cyber-art/agent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();
-            assert_eq!(release_url(&app, "x86_64"), format!("https://ghfast.top/{direct}"), "{set:?}");
+            assert_eq!(release_url(&app, "x86_64", None), format!("https://ghfast.top/{direct}"), "{set:?}");
         }
         // Cleared in the panel, which stores an empty string rather than removing
         // the row.
         app.db.set("github_proxy", "").unwrap();
-        assert_eq!(release_url(&app, "x86_64"), direct);
+        assert_eq!(release_url(&app, "x86_64", None), direct);
+        assert!(release_url(&app, "aarch64", Some("1.3.0"))
+            .contains("/releases/download/v1.3.0/monitor-agent-aarch64-"));
     }
 
     #[test]
