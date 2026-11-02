@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowDown, ArrowUp, ArrowUpCircle, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Download, GripVertical, Layers, MoreHorizontal, Palette, Pencil, Plus, RefreshCw, Search, Send, Server, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -9,7 +9,9 @@ import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
+import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { AdminLayout } from "@/components/AdminLayout"
+import { NodeCards, NodeOverview } from "@/components/NodeCards"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -191,6 +193,12 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
 
   return {
     order,
+    shift: (id: number, delta: number) => {
+      body.current = null
+      orderBeforeDrag.current = ids()
+      const next = move(id, ids().indexOf(id) + delta)
+      if (next) save(next)
+    },
     row: (id: number) => ({
       "data-id": id,
       "data-dragging": dragging === id || undefined,
@@ -497,7 +505,7 @@ function Field({ label, hint, help, helpWidth, className = "", children }: {
 }) {
   const title = <Label className="text-sm font-medium">{label}</Label>
   return (
-    <div className={`space-y-2 ${className}`}>
+    <div className={`min-w-0 space-y-2 ${className}`}>
       {help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title}
       {children}
       {/* Kept whole between punctuation, as in Help below. */}
@@ -523,7 +531,7 @@ function SwitchRow({ label, hint, extra, help, helpWidth, checked, onChange }: {
   return (
     <div className="flex items-start gap-2">
       <Switch aria-labelledby={id} checked={checked} onCheckedChange={onChange} className="mt-0.5" />
-      <div className="space-y-1">
+      <div className="min-w-0 space-y-1">
         <div className="text-sm leading-snug text-balance">
           <span id={id}>{label}</span>
           {help && (
@@ -1609,6 +1617,35 @@ function trafficTone(n: Node, warnAt: number) {
   return n.month_used * 100 >= n.traffic_limit * warnAt ? "text-near" : ""
 }
 
+function NodeMoreActions({ node, install, billing, remove, shift, canInstall, canMove, first, last }: {
+  node: Node
+  install: () => void
+  billing: () => void
+  remove: () => void
+  shift: (delta: number) => void
+  canInstall: boolean
+  canMove: boolean
+  first: boolean
+  last: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const run = (action: () => void) => { setOpen(false); action() }
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild><Button variant="outline" size="icon" aria-label={`更多操作：${node.name}`}><MoreHorizontal /></Button></PopoverTrigger>
+      <PopoverContent align="end" className="node-action-menu" aria-label={`${node.name}的更多操作`}>
+        <Button variant="ghost" disabled={!canInstall} onClick={() => run(install)}><Download /> 安装 Agent</Button>
+        <Button variant="ghost" onClick={() => run(billing)}><CalendarClock /> 续费设置</Button>
+        <div className="my-1 border-t" />
+        <Button variant="ghost" disabled={!canMove || first} onClick={() => run(() => shift(-1))}><ArrowUp /> 上移节点</Button>
+        <Button variant="ghost" disabled={!canMove || last} onClick={() => run(() => shift(1))}><ArrowDown /> 下移节点</Button>
+        <div className="my-1 border-t" />
+        <Button variant="ghost" className="text-destructive" onClick={() => run(remove)}><Trash2 /> 删除节点</Button>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
   const warnAt = Number(useSettings().s?.notify_traffic) || 80
   const [creating, setCreating] = useState(false)
@@ -1630,7 +1667,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const visible = inGroup(searchNodes(drag.order, query), group)
   useEffect(() => {
     if (added.current === null || !nodes.some((n) => n.id === added.current)) return
-    document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
+    const entries = document.querySelectorAll<HTMLElement>(`[data-node-id="${added.current}"], tbody tr[data-id="${added.current}"]`)
+    Array.from(entries).find((element) => element.getClientRects().length)?.scrollIntoView({ block: "center", behavior: "smooth" })
     added.current = null
   })
   const searching = query.trim() !== "" || group !== "all"
@@ -1653,26 +1691,36 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
 
   return (
     <div className="space-y-4">
+      <NodeOverview nodes={nodes} />
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        <div className="mr-auto flex w-full gap-2 sm:w-auto">
+      <div className="nodes-toolbar">
+        <div className="nodes-toolbar-search">
           <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
           <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
         </div>
-        <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
-          <Layers /> 分组
-        </Button>
-        {/* An open window is visible from the list itself, so nobody has to
-            remember they left one open. */}
-        <Button variant="outline" disabled={!!refusal} onClick={() => { reg.sync(); setRegistering(true) }}>
-          <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
-        </Button>
-        <Button disabled={!!refusal} onClick={() => setCreating(true)}>
-          <Plus /> 添加节点
-        </Button>
+        <div className="nodes-toolbar-actions">
+          <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
+            <Layers /> 分组
+          </Button>
+          {/* An open window is visible from the list itself, so nobody has to
+              remember they left one open. */}
+          <Button variant="outline" disabled={!!refusal} onClick={() => { reg.sync(); setRegistering(true) }}>
+            <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
+          </Button>
+          <Button disabled={!!refusal} onClick={() => setCreating(true)}>
+            <Plus /> 添加节点
+          </Button>
+        </div>
       </div>
 
-      <Card className="overflow-x-auto p-0">
+      <NodeCards nodes={visible} searching={searching} onCopy={(address) => copy(address, `已复制 ${address}`)} actions={(node) => <>
+        <Button variant="outline" onClick={() => setEditing(node)} aria-label={`编辑节点：${node.name}`}><Pencil /> 编辑节点</Button>
+        <NodeMoreActions node={node} install={() => setInstalling(node)} billing={() => setBilling(node)} remove={() => setDeleting(node)}
+          shift={(delta) => drag.shift(node.id, delta)} canInstall={!refusal} canMove={!searching}
+          first={visible[0].id === node.id} last={visible[visible.length - 1].id === node.id} />
+      </>} />
+
+      <Card className="node-desktop-table overflow-x-auto p-0">
         <Table>
           <TableHeader>
             {/* Percentages, or the address column swallows every spare pixel
@@ -1736,9 +1784,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       the three-character 不公开, so a lone pill sits where it
                       would above that one and every row lines up. */}
                   <div className="flex w-fit min-w-14 flex-col items-center gap-1">
-                    <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
-                      {n.online ? "在线" : "离线"}
-                    </Badge>
+                    <span className="node-status" data-online={n.online}>{n.online ? "在线" : "离线"}</span>
                     {!n.public && <Badge variant="outline" className="font-normal">不公开</Badge>}
                     {/* Under the badge, not inside it: the column is a tenth of
                         the table and the three do not share one line. A slot of
@@ -2045,7 +2091,7 @@ function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]
         <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
         <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
       </div>
-      <Card className="overflow-x-auto p-0">
+      <Card className="responsive-table overflow-x-auto p-0">
         <Table>
           <TableHeader>
             <TableRow>
@@ -2060,13 +2106,13 @@ function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]
               const names = mine.map((t) => t.name).join("、")
               return (
                 <TableRow key={n.id}>
-                  <TableCell className="whitespace-normal">
+                  <TableCell data-label="节点" className="whitespace-normal">
                     <div className="font-medium text-balance break-keep">{nameText(n.name)}</div>
                     {n.group && <div className="text-xs text-balance text-muted-foreground">{n.group}</div>}
                   </TableCell>
                   {/* max-w-0 lets the cell take what is left and no more, so a
                       long list truncates instead of widening the table. */}
-                  <TableCell className="max-w-0 text-sm">
+                  <TableCell data-label="监控" className="max-w-0 text-sm">
                     {mine.length ? (
                       <div className="truncate" title={names}>
                         <span className="tnum">{mine.length} 个</span>
@@ -2076,7 +2122,7 @@ function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]
                       <span className="text-muted-foreground">未配置</span>
                     )}
                   </TableCell>
-                  <TableCell className="text-right">
+                  <TableCell data-label="操作" className="text-right">
                     <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="选择监控" aria-label="选择监控"><Pencil /></Button>
                   </TableCell>
                 </TableRow>
@@ -2137,7 +2183,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
   if (!tasks) return null
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <div role="group" aria-label="视图" className="inline-flex rounded-lg bg-muted p-0.5">
           {(["task", "node"] as const).map((v) => (
             <button
@@ -2155,7 +2201,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
         </Button>
       </div>
 
-      {view === "node" ? <PingByNode nodes={nodes} tasks={tasks} reload={load} /> : <Card className="overflow-x-auto p-0">
+      {view === "node" ? <PingByNode nodes={nodes} tasks={tasks} reload={load} /> : <Card className="responsive-table overflow-x-auto p-0">
         <Table>
           <TableHeader>
             <TableRow>
@@ -2169,19 +2215,19 @@ function Ping({ nodes }: { nodes: Node[] }) {
           <TableBody>
             {drag.order.map((t) => (
               <TableRow key={t.id} {...drag.row(t.id)}>
-                <TableCell className="font-medium">
+                <TableCell data-label="名称" className="font-medium">
                   <div className="flex items-center gap-2">
                     <DragHandle {...drag.handle(t.id)} name={t.name} />
                     {t.name}
                   </div>
                 </TableCell>
-                <TableCell className="tnum text-sm">{t.target}</TableCell>
-                <TableCell className="tnum text-sm">{t.interval}s</TableCell>
-                <TableCell className="text-sm whitespace-nowrap text-muted-foreground">
+                <TableCell data-label="目标" className="tnum text-sm">{t.target}</TableCell>
+                <TableCell data-label="间隔" className="tnum text-sm">{t.interval}s</TableCell>
+                <TableCell data-label="节点" className="text-sm whitespace-nowrap text-muted-foreground">
                   {t.nodes.length > 0 && t.nodes.length === nodes.length ? "全部" : `${t.nodes.length} 个`}
                   {t.auto_join && <Badge variant="outline" className="ml-2 font-normal">自动加入</Badge>}
                 </TableCell>
-                <TableCell className="text-right whitespace-nowrap">
+                <TableCell data-label="操作" className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" onClick={() => setEditing(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(t)} title="删除监控" aria-label="删除监控">
                     <Trash2 className="text-destructive" />
@@ -2379,7 +2425,7 @@ function ThemeSettings({ theme, saved, onClose }: {
           </div>
           {/* One row on a phone as well: stacked, the three buttons would take a
               third of the height the fields have. */}
-          <DialogFooter className="flex-row items-center border-t pt-4">
+          <DialogFooter className="flex-row flex-wrap items-center border-t pt-4">
             <Button
               type="button"
               variant="ghost"
@@ -2567,16 +2613,16 @@ function Themes() {
                 />
               </button>
             )}
-            <div className="flex items-start gap-3">
+            <div className="flex min-w-0 flex-col gap-3">
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <h3 className="font-medium">{theme.name}</h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="min-w-0 font-medium wrap-anywhere">{theme.name}</h3>
                   {theme.selected && <Badge>当前</Badge>}
                   {theme.builtin && <Badge variant="secondary" className="font-normal">内置</Badge>}
                 </div>
                 <p className="mt-1 text-sm text-muted-foreground">{theme.description}</p>
               </div>
-              <div className="flex shrink-0 items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
                   {theme.selected ? "使用中" : "使用"}
                 </Button>
@@ -2766,7 +2812,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
   return (
     <div className="space-y-4">
       <Card className="gap-4 p-5">
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="admin-form-grid">
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
           </Field>
@@ -2797,7 +2843,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             />
           </Field>
           <Field label="站点图标" hint="标签页、书签和手机主屏幕上的图标，选好即生效，换主题也保留">
-            <div className="flex items-center gap-2">
+            <div className="form-inline-actions">
               {!s.favicon && <span className="text-sm text-muted-foreground">默认</span>}
               <div className="flex size-9 shrink-0 items-center justify-center rounded-md border">
                 <img src={String(s.favicon || "/favicon.svg?theme")} alt="站点图标" className="size-6 object-contain" />
@@ -3050,7 +3096,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1 basis-64">
             <h3 className="text-sm font-medium">通知渠道</h3>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
               Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
@@ -3575,7 +3621,10 @@ function AgentUpgrades({ nodes, latest }: { nodes: Node[]; latest: string }) {
   }, [running, load])
 
   const activeIds = new Set(jobs.filter(upgradeRunning).map((job) => job.node_id))
-  const eligible = outdatedAgents(nodes, target.trim()).filter((node) => node.online && node.can_upgrade && !activeIds.has(node.id))
+  const pending = outdatedAgents(nodes, target.trim())
+  const bootstrap = pending.filter((node) => node.online && !node.can_upgrade)
+  const offline = pending.filter((node) => !node.online)
+  const eligible = pending.filter((node) => node.online && node.can_upgrade && !activeIds.has(node.id))
   const selected = eligible.filter((node) => chosen.has(node.id))
   const visibleJobs = jobs.filter((job) => nodes.some((node) => node.id === job.node_id))
 
@@ -3607,26 +3656,32 @@ function AgentUpgrades({ nodes, latest }: { nodes: Node[]; latest: string }) {
           <Input id="agent-upgrade-version" className="w-40" placeholder="例如 1.3.0" value={target} disabled={busy || open} onChange={(event) => setTarget(event.target.value)} />
         </div>
         <Button disabled={!eligible.length || busy || !target.trim()} onClick={() => { setChosen(new Set(eligible.map((node) => node.id))); setOpen(true) }}>
-          <ArrowUpCircle /> 批量升级{eligible.length > 0 && `（${eligible.length} 台可选）`}
+          <ArrowUpCircle /> 选择节点升级
         </Button>
         <Button variant="ghost" size="sm" onClick={load}><RefreshCw /> 刷新结果</Button>
       </div>
+      <div className="upgrade-availability" role="status">
+        <strong>{eligible.length} 台可远程升级</strong>
+        {bootstrap.length > 0 && <span>{bootstrap.length} 台需先用安装脚本更新</span>}
+        {offline.length > 0 && <span>{offline.length} 台离线</span>}
+        {!target.trim() ? <span>请填写目标版本</span> : !pending.length && <span>暂无待升级节点</span>}
+      </div>
       <p className="text-xs leading-relaxed text-muted-foreground">
-        选择在线节点后统一升级，沿用每台机器的 token、网卡和上报间隔。下载期间继续监控，切换版本时短暂重连；新版本连接主控后才显示成功。
+        可选择单台或多台在线节点升级，沿用每台机器的 token、网卡和上报间隔。下载期间继续监控，切换版本时短暂重连；新版本连接主控后才显示成功。
         {!latest && " 暂时查不到最新版本，可填写已发布的版本号。"}
       </p>
       {error && <p className="text-sm text-destructive" role="alert">升级结果加载失败：{error}</p>}
       {visibleJobs.length > 0 && (
-        <div className="overflow-x-auto rounded-md border">
+        <div className="responsive-table overflow-x-auto rounded-xl border">
           <Table>
             <TableHeader><TableRow><TableHead>节点</TableHead><TableHead>目标版本</TableHead><TableHead>状态</TableHead><TableHead>说明</TableHead></TableRow></TableHeader>
             <TableBody>
               {visibleJobs.map((job) => (
                 <TableRow key={job.node_id}>
-                  <TableCell className="font-medium">{nodes.find((node) => node.id === job.node_id)!.name}</TableCell>
-                  <TableCell>v{job.version}</TableCell>
-                  <TableCell><Badge variant={job.status === "failed" ? "destructive" : "secondary"}>{UPGRADE_LABELS[job.status]}</Badge></TableCell>
-                  <TableCell className="max-w-80 whitespace-normal text-xs text-muted-foreground">{job.message || (job.status === "succeeded" ? "已收到目标版本的连接确认" : "—")}</TableCell>
+                  <TableCell data-label="节点" className="font-medium">{nodes.find((node) => node.id === job.node_id)!.name}</TableCell>
+                  <TableCell data-label="目标版本">v{job.version}</TableCell>
+                  <TableCell data-label="状态"><Badge variant={job.status === "failed" ? "destructive" : "secondary"}>{UPGRADE_LABELS[job.status]}</Badge></TableCell>
+                  <TableCell data-label="说明" className="max-w-80 whitespace-normal text-xs text-muted-foreground">{job.message || (job.status === "succeeded" ? "已收到目标版本的连接确认" : "—")}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -3637,7 +3692,7 @@ function AgentUpgrades({ nodes, latest }: { nodes: Node[]; latest: string }) {
         <Dialog open onOpenChange={(next) => { if (!next && !busy) setOpen(false) }}>
           <DialogContent className="sm:max-w-2xl">
             <DialogHeader>
-              <DialogTitle>批量升级 agent 到 v{target.trim()}</DialogTitle>
+              <DialogTitle>升级 agent 到 v{target.trim()}</DialogTitle>
               <DialogDescription>已选 {selected.length} 台节点。升级会短暂断开监控连接；下载或校验失败时保留原版本，切换后无法连接主控时恢复原版本。</DialogDescription>
             </DialogHeader>
             <NodePicker nodes={eligible} chosen={chosen} disabled={busy} onPick={(list, on) => setChosen((previous) => {
@@ -3800,18 +3855,10 @@ function Update({ versions, reload, nodes, site, refusal }: {
 
 // Each area is its own route rather than a tab, so a page can be linked to and a
 // reload returns to the same section.
-const ADMIN_SECTIONS = [
-  { path: "/admin/nodes", label: "节点", icon: Server },
-  { path: "/admin/ping", label: "延迟", icon: Radio },
-  { path: "/admin/notify", label: "通知", icon: Bell },
-  { path: "/admin/data", label: "数据", icon: Database },
-  { path: "/admin/themes", label: "主题", icon: Palette },
-  { path: "/admin/security", label: "安全", icon: Shield },
-  { path: "/admin/settings", label: "设置", icon: Settings },
-  { path: "/admin/update", label: "更新", icon: ArrowUpCircle },
-] as const
 
 export function Admin({
+  navigationOpen,
+  onNavigationChange,
   path,
   go,
   nodes,
@@ -3820,6 +3867,8 @@ export function Admin({
   refusal,
   reloadMe,
 }: {
+  navigationOpen: boolean
+  onNavigationChange: (open: boolean) => void
   path: string
   go: (to: string) => void
   nodes: Node[]
@@ -3835,48 +3884,24 @@ export function Admin({
     !!versions?.notice
     && (behind(versions.hub, versions.hub_latest) || outdatedAgents(nodes, versions.agent_latest).length > 0)
   return (
-    <div className="flex flex-col gap-6 md:flex-row">
-      <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
-        {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
-          const active = path === to
-          return (
-            <button
-              key={to}
-              onClick={() => go(to)}
-              aria-current={active ? "page" : undefined}
-              className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
-                active ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
-              }`}
-            >
-              <Icon className="size-4" />
-              {label}
-              {to === "/admin/update" && updates && (
-                <span className="ml-1 size-1.5 shrink-0 rounded-full bg-foreground md:ml-auto" title="有新版本" />
-              )}
-            </button>
-          )
-        })}
-      </nav>
-
-      <div className="min-w-0 flex-1">
-        {path === "/admin/ping" ? (
-          <Ping nodes={nodes} />
-        ) : path === "/admin/notify" ? (
-          <Notify nodes={nodes} refresh={refresh} />
-        ) : path === "/admin/data" ? (
-          <Data />
-        ) : path === "/admin/themes" ? (
-          <Themes />
-        ) : path === "/admin/security" ? (
-          <Security site={site} />
-        ) : path === "/admin/settings" ? (
-          <SettingsTab onSaved={reloadMe} />
-        ) : path === "/admin/update" ? (
-          <Update versions={versions} reload={reload} nodes={nodes} site={site} refusal={refusal} />
-        ) : (
-          <Nodes nodes={nodes} refresh={refresh} site={site} refusal={refusal} />
-        )}
-      </div>
-    </div>
+    <AdminLayout path={path} go={go} updates={updates} navigationOpen={navigationOpen} onNavigationChange={onNavigationChange}>
+      {path === "/admin/ping" ? (
+        <Ping nodes={nodes} />
+      ) : path === "/admin/notify" ? (
+        <Notify nodes={nodes} refresh={refresh} />
+      ) : path === "/admin/data" ? (
+        <Data />
+      ) : path === "/admin/themes" ? (
+        <Themes />
+      ) : path === "/admin/security" ? (
+        <Security site={site} />
+      ) : path === "/admin/settings" ? (
+        <SettingsTab onSaved={reloadMe} />
+      ) : path === "/admin/update" ? (
+        <Update versions={versions} reload={reload} nodes={nodes} site={site} refusal={refusal} />
+      ) : (
+        <Nodes nodes={nodes} refresh={refresh} site={site} refusal={refusal} />
+      )}
+    </AdminLayout>
   )
 }

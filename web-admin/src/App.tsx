@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react"
-import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
+import { ExternalLink, LogOut, Menu, Moon, Server, Sun } from "lucide-react"
 import { Toaster } from "sonner"
 
 import { Admin } from "@/components/Admin"
@@ -34,6 +34,7 @@ function usePath() {
       const to = normalise(next)
       history.pushState({}, "", to)
       setPath(to)
+      scrollTo(0, 0)
     }, []),
   ] as const
 }
@@ -99,6 +100,7 @@ function useTheme() {
 
 export default function App() {
   const [path, go] = usePath()
+  const [navigationOpen, setNavigationOpen] = useState(false)
   const [dark, toggleTheme] = useTheme()
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
@@ -152,19 +154,23 @@ export default function App() {
     // shortened; these open after 300 ms.
     <TooltipProvider delayDuration={300}>
       <div className="min-h-svh">
-        <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-          <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
+        <header className="app-header">
+          <div className="app-header-inner">
             {/* The site name is the way back to the status page, as in the
                 theme's own header. */}
-            <a href="/" className="font-semibold transition-opacity hover:opacity-70">
-              {me.site_name || "Monitor"}
+            <a href="/" className="app-brand">
+              <span className="app-brand-icon"><Server className="size-5" /></span>
+              <span className="app-brand-name">{me.site_name || "Monitor"}<span>管理后台</span></span>
             </a>
-            <span className="text-xs text-muted-foreground">后台</span>
             <div className="flex-1" />
+            <Button id="admin-navigation-trigger" variant="ghost" size="icon" className="header-menu-button" aria-label="打开后台导航"
+              aria-haspopup="dialog" aria-controls="admin-navigation-dialog" aria-expanded={navigationOpen} disabled={!nodes} onClick={() => setNavigationOpen(true)}>
+              <Menu />
+            </Button>
             {/* The status page is a separate app, so this is a navigation. */}
             <Button variant="ghost" size="sm" asChild>
-              <a href="/">
-                <ExternalLink /> 状态面板
+              <a href="/" aria-label="打开状态面板">
+                <ExternalLink /> <span className="header-action-label">状态面板</span>
               </a>
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
@@ -176,12 +182,14 @@ export default function App() {
           </div>
         </header>
 
-        <main className="mx-auto max-w-7xl space-y-5 px-4 py-6">
-          {error && <p className="text-sm text-destructive">{error}</p>}
+        <main className="app-main">
+          {error && <p role="alert" className="mb-5 rounded-xl border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</p>}
           {!nodes ? (
             <Skeleton className="h-64" />
           ) : (
             <Admin
+              navigationOpen={navigationOpen}
+              onNavigationChange={setNavigationOpen}
               path={path}
               go={go}
               nodes={nodes}
