@@ -88,6 +88,8 @@ pub struct Agent {
     pub last_seen: i64,
     /// The installed agent explicitly enabled self-updates in its hello.
     pub can_upgrade: bool,
+    /// The installer supplied a root-owned, fixed-purpose uninstall helper.
+    pub can_uninstall: bool,
     /// The wall-clock minute this session last wrote a history row for, or the
     /// one it opened in. A row is written when a report arrives past it.
     ///
@@ -114,6 +116,7 @@ impl Agent {
             metrics: serde_json::Value::Null,
             last_seen: 0,
             can_upgrade: false,
+            can_uninstall: false,
             last_minute: None,
             mark: None,
             minute: Minute::default(),
@@ -570,6 +573,7 @@ fn dispatch(
         }
         "report" => report(app, node_id, rpc.params, arrival)?,
         "upgrade.result" => crate::upgrade::progress(app, node_id, rpc.params)?,
+        "uninstall.result" => crate::removal::progress(app, node_id, rpc.params)?,
         "ping.result" if !session.admit_result(arrival.tick) => session.complain(
             node_id,
             format_args!(
@@ -603,6 +607,7 @@ fn save_facts(app: &App, node_id: i64, ip: &str, facts: &serde_json::Value) -> R
     }
     if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
         agent.can_upgrade = facts.get("can_upgrade").and_then(|v| v.as_bool()) == Some(true);
+        agent.can_uninstall = facts.get("can_uninstall").and_then(|v| v.as_bool()) == Some(true);
     }
     Ok(changed.then_some(source))
 }

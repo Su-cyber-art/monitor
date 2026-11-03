@@ -12,11 +12,12 @@ import { Label } from "@/components/ui/label"
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { AdminLayout } from "@/components/AdminLayout"
 import { NodeCards, NodeOverview } from "@/components/NodeCards"
+import { NodeDeleteDialog, RemovalHistory, useRemovals } from "@/components/NodeDelete"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { agentCommand, agentPlatform, type AgentPlatform, api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { agentCommand, agentPlatform, type AgentPlatform, api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, visibleUpgradeResults, type AgentUpgrade, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1644,7 +1645,9 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [registering, setRegistering] = useState(false)
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
-  const [removing, setRemoving] = useState(false)
+  // Live node updates must not restart the result dialog's close timer.
+  const closeDeletion = useCallback(() => setDeleting(null), [])
+  const removals = useRemovals()
   const [query, setQuery] = useState("")
   const [group, setGroup] = useGroupFilter(nodes)
   const [grouping, setGrouping] = useState(false)
@@ -1661,26 +1664,11 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     added.current = null
   })
   const searching = query.trim() !== "" || group !== "all"
-  const uninstall = refusal ? "" : agentCommand(site, agentPlatform(deleting?.os ?? ""), ["--uninstall"])
-
-  async function remove() {
-    if (!deleting) return
-    setRemoving(true)
-    try {
-      await api(`/nodes/${deleting.id}`, { method: "DELETE" })
-      toast.success("已删除")
-      setDeleting(null)
-      refresh()
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setRemoving(false)
-    }
-  }
 
   return (
     <div className="space-y-4">
       <NodeOverview nodes={nodes} />
+      <RemovalHistory removals={removals} nodes={nodes} onInspect={setDeleting} />
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="nodes-toolbar">
         <div className="nodes-toolbar-search">
@@ -1868,31 +1856,15 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
         />
       )}
       {deleting && (
-        <ConfirmDialog
-          title={`删除节点「${deleting.name}」？`}
-          description="历史指标、流量记录和凭证一并删除，不可恢复。"
-          confirmLabel="删除节点"
-          busy={removing}
-          onClose={() => setDeleting(null)}
-          onConfirm={remove}
-        >
-          {/* Deleting the node leaves the agent running on the machine, retrying
-              with a token the hub no longer accepts. */}
-          {uninstall && (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <Label className="text-sm font-medium">卸载 agent</Label>
-                <Button variant="ghost" size="sm" onClick={() => copy(uninstall)}>
-                  <Copy className="size-4" /> 复制
-                </Button>
-              </div>
-              <Command>{uninstall}</Command>
-              <p className="text-xs text-muted-foreground">
-                {agentPlatform(deleting.os) === "windows" ? "在管理员 PowerShell 中执行" : "在这台机器上以 root 执行"}，停止 agent 并删除程序、凭证和服务文件。
-              </p>
-            </div>
-          )}
-        </ConfirmDialog>
+        <NodeDeleteDialog
+          key={deleting.id}
+          node={nodes.find((node) => node.id === deleting.id) ?? deleting}
+          removals={removals}
+          uninstall={refusal ? "" : agentCommand(site, agentPlatform(deleting.os), ["--uninstall"])}
+          bootstrap={refusal || agentPlatform(deleting.os) !== "linux" ? "" : agentCommand(site, "linux", ["--upgrade"])}
+          onClose={closeDeletion}
+          onDeleted={refresh}
+        />
       )}
     </div>
   )
@@ -3573,16 +3545,6 @@ function byVersion(nodes: Node[]): [string, Node[]][] {
  * The hub card names the release alone: how to take it depends on how the hub
  * was installed, script or container, which the hub cannot tell.
  */
-type AgentUpgrade = {
-  node_id: number
-  id: string
-  version: string
-  status: "queued" | "downloading" | "restarting" | "succeeded" | "failed"
-  message: string
-  started_at: number
-  updated_at: number
-}
-
 const UPGRADE_LABELS = { queued: "等待响应", downloading: "下载中", restarting: "重启并确认版本", succeeded: "升级成功", failed: "升级失败" }
 const upgradeRunning = (job: AgentUpgrade) => !["succeeded", "failed"].includes(job.status)
 
@@ -3598,7 +3560,7 @@ function AgentUpgrades({ nodes, latest }: { nodes: Node[]; latest: string }) {
   const load = useCallback(() => {
     const request = ++revision.current
     return api<{ upgrades: AgentUpgrade[] }>("/agent-upgrades")
-      .then((data) => { if (request === revision.current) { setJobs(data.upgrades); setError("") } })
+      .then((data) => { if (request === revision.current) { setJobs((previous) => visibleUpgradeResults(previous, data.upgrades)); setError("") } })
       .catch((e: Error) => { if (request === revision.current) setError(e.message) })
   }, [])
   useEffect(() => { load() }, [load])
@@ -3617,15 +3579,21 @@ function AgentUpgrades({ nodes, latest }: { nodes: Node[]; latest: string }) {
   const selected = eligible.filter((node) => chosen.has(node.id))
   const visibleJobs = jobs.filter((job) => nodes.some((node) => node.id === job.node_id))
 
+  function refreshResults() {
+    setJobs((previous) => previous.filter((job) => job.status !== "succeeded"))
+    load()
+  }
+
   async function start() {
+    const ids = selected.map((node) => node.id)
     setBusy(true)
     ++revision.current
     try {
       const data = await api<{ started: number; upgrades: AgentUpgrade[] }>("/agent-upgrades", {
-        method: "POST", body: JSON.stringify({ ids: selected.map((node) => node.id), version: target.trim() }),
+        method: "POST", body: JSON.stringify({ ids, version: target.trim() }),
       })
       ++revision.current
-      setJobs(data.upgrades)
+      setJobs((previous) => visibleUpgradeResults(previous, data.upgrades, ids))
       setError("")
       setOpen(false)
       if (data.started) toast.success(`已向 ${data.started} 台节点下发升级，请查看每台节点的结果`)
@@ -3647,7 +3615,7 @@ function AgentUpgrades({ nodes, latest }: { nodes: Node[]; latest: string }) {
         <Button disabled={!eligible.length || busy || !target.trim()} onClick={() => { setChosen(new Set(eligible.map((node) => node.id))); setOpen(true) }}>
           <ArrowUpCircle /> 选择节点升级
         </Button>
-        <Button variant="ghost" size="sm" onClick={load}><RefreshCw /> 刷新结果</Button>
+        <Button variant="ghost" size="sm" onClick={refreshResults}><RefreshCw /> 刷新结果</Button>
       </div>
       <div className="upgrade-availability" role="status">
         <strong>{eligible.length} 台可远程升级</strong>

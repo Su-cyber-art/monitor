@@ -1,7 +1,7 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { agentCommand, agentPlatform, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { agentCommand, agentPlatform, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection, visibleUpgradeResults, type AgentUpgrade } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -45,6 +45,24 @@ assert.equal(behind("1.2.0", "1.10.0"), true)
 assert.equal(behind("1.3.0", "1.2.0"), false)
 assert.equal(behind("1.2.0", ""), false)
 
+const upgradeJob = (id: string, node_id: number, status: AgentUpgrade["status"]): AgentUpgrade => ({
+  id, node_id, status, version: "1.4.0", message: "", started_at: 1, updated_at: 2,
+})
+const pastSuccess = upgradeJob("past", 1, "succeeded")
+const waiting = upgradeJob("waiting", 2, "queued")
+const downloading = upgradeJob("download", 3, "downloading")
+const restarting = upgradeJob("restart", 4, "restarting")
+const failure = upgradeJob("failed", 5, "failed")
+const fetched = [pastSuccess, waiting, downloading, restarting, failure]
+assert.deepEqual(visibleUpgradeResults([], fetched), [waiting, downloading, restarting, failure], "refresh retains unfinished and failed tasks, not past successes")
+const liveSuccess = { ...waiting, status: "succeeded" as const }
+const observed = visibleUpgradeResults([waiting, failure], [pastSuccess, liveSuccess, failure])
+assert.deepEqual(observed, [liveSuccess, failure], "a completion observed on this page must be shown")
+assert.deepEqual(visibleUpgradeResults(observed, [pastSuccess, liveSuccess, failure]), observed, "automatic polling keeps the current result visible")
+assert.deepEqual(visibleUpgradeResults(observed.filter((job) => job.status !== "succeeded"), [pastSuccess, liveSuccess, failure]), [failure], "manual refresh clears successful results without losing failures")
+assert.deepEqual(visibleUpgradeResults([], [pastSuccess, liveSuccess], [2]), [liveSuccess], "a newly requested task can finish before the start response arrives")
+assert.deepEqual(visibleUpgradeResults([liveSuccess], [upgradeJob("another-attempt", 2, "succeeded")]), [], "a new request cannot inherit an old request's visibility just by sharing a node")
+
 // An emptied traffic field means the counter is not to be corrected. Sent as 0
 // it would clear a lifetime total, which must never decrease.
 const shown = { total_rx: "1.5", total_tx: "2", month_rx: "0.25", month_tx: "1" }
@@ -60,7 +78,7 @@ assert.equal(shortAddress("2604:a880:800:10::7a1:e001"), "2604:a880…7a1:e001")
 assert.equal(shortAddress("2a0e:1d80:ffff:ffff::1234"), "2a0e:1d80…ffff::1234")
 assert.equal(shortAddress("2001:db8:1054:84::a4"), "2001:db8:1054:84::a4")
 assert.equal(shortAddress("203.0.113.84"), "203.0.113.84")
-console.log("partial edits, traffic corrections and provisioning checks passed")
+console.log("partial edits, traffic corrections, provisioning and upgrade result checks passed")
 
 // --iface from the two lists the install dialogs show, and back.
 assert.equal(ifaceSpec({ only: " eth1, pppoe-wan ", skip: "" }), "eth1,pppoe-wan")

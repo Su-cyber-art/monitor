@@ -64,6 +64,20 @@ pub async fn start(_: Admin, State(app): State<Shared>, Json(request): Json<Requ
         return answer(StatusCode::NOT_FOUND, "部分节点已被删除，请刷新后重试");
     }
     let now = Utc::now().timestamp();
+    if let Err(e) = app.db.expire_agent_removals(now) {
+        return fail(e);
+    }
+    match app.db.agent_removals() {
+        Ok(jobs)
+            if jobs.iter().any(|job| {
+                ids.contains(&job.node_id) && !matches!(job.status.as_str(), "succeeded" | "failed")
+            }) =>
+        {
+            return answer(StatusCode::CONFLICT, "所选节点正在卸载或卸载结果未确认，暂时不能升级");
+        }
+        Ok(_) => {}
+        Err(e) => return fail(e),
+    }
     if let Err(e) = app.db.expire_agent_upgrades(now) {
         return fail(e);
     }
@@ -140,6 +154,18 @@ mod tests {
         let id = app.db.create_node(&Node { name: token.into(), ..Default::default() }, token).unwrap();
         app.db.save_facts(id, &json!({"agent_version":"1.3.0"}), "", "").unwrap();
         id
+    }
+
+    #[tokio::test]
+    async fn a_node_being_uninstalled_cannot_receive_an_upgrade() {
+        let app = Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        let node = node(&app, "uninstalling");
+        app.db.start_agent_removal(node, "removal", Utc::now().timestamp()).unwrap();
+        let response =
+            start(Admin, State(app.clone()), Json(Request { ids: vec![node], version: "1.4.1".into() }))
+                .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(app.db.agent_upgrades().unwrap().is_empty());
     }
 
     #[tokio::test]

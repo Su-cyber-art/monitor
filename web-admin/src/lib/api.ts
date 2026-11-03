@@ -30,6 +30,8 @@ export type Node = {
   online: boolean
   /** Panel only. This running agent has self-updates enabled. */
   can_upgrade?: boolean
+  /** Panel only. The root-owned remote uninstall helper is installed. */
+  can_uninstall?: boolean
   // Seconds since the last report on the hub's clock, null for a node never
   // seen. The hub also sends the timestamp, which the panel leaves alone:
   // against this browser's clock it is off by as much as that clock is.
@@ -90,6 +92,23 @@ export type Node = {
 }
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[]; auto_join: boolean }
+
+export type AgentUpgrade = {
+  node_id: number
+  id: string
+  version: string
+  status: "queued" | "downloading" | "restarting" | "succeeded" | "failed"
+  message: string
+  started_at: number
+  updated_at: number
+}
+
+/** Keep live completions visible until refresh, without resurfacing old successes. */
+export function visibleUpgradeResults(previous: AgentUpgrade[], incoming: AgentUpgrade[], requestedNodes: number[] = []): AgentUpgrade[] {
+  const observed = new Set(previous.map((job) => job.id))
+  const requested = new Set(requestedNodes)
+  return incoming.filter((job) => job.status !== "succeeded" || observed.has(job.id) || requested.has(job.node_id))
+}
 
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {

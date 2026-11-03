@@ -31,6 +31,7 @@ mod db;
 mod frontend;
 mod notify;
 mod platform;
+mod removal;
 mod upgrade;
 #[cfg(test)]
 mod upgrade_e2e;
@@ -657,6 +658,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes/order", put(api::reorder_nodes))
         .route("/api/nodes/batch", put(api::update_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
+        .route("/api/nodes/{id}/removal", post(removal::start))
         .route("/api/nodes/{id}/token", get(api::node_token).post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/nodes/{id}/ping-tasks", put(api::set_node_ping_tasks))
@@ -668,6 +670,7 @@ async fn main() -> Result<()> {
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/version", get(api::versions))
         .route("/api/agent-upgrades", get(upgrade::list).post(upgrade::start))
+        .route("/api/agent-removals", get(removal::list).delete(removal::dismiss))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
@@ -706,6 +709,7 @@ async fn main() -> Result<()> {
                 .route("/api/agent/ws", get(agent_ws::handler))
                 .route("/api/agent/echo", get(agent_ws::echo))
                 .route("/api/agent/register", post(api::agent_register))
+                .route("/api/agent/removal", post(removal::callback))
                 .route("/install.sh", get(install_script))
                 .route("/install.ps1", get(install_windows))
                 .route("/install-macos.sh", get(install_macos))

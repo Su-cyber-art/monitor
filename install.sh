@@ -19,6 +19,9 @@ ENV_FILE="$ROOT/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
 LOG_FILE="/var/log/monitor-agent.log"
+UNINSTALL_HELPER="$ROOT/agent-uninstall"
+UNINSTALL_UNIT="/etc/systemd/system/monitor-agent-uninstall.service"
+UNINSTALL_PATH="/etc/systemd/system/monitor-agent-uninstall.path"
 SERVER=""
 TOKEN=""
 REGISTER=""
@@ -62,13 +65,17 @@ done
 # hub may be installed in $ROOT as well, so the directory is removed only once
 # empty.
 if [ -n "$UNINSTALL" ]; then
+	systemctl disable --now monitor-agent-uninstall.path 2>/dev/null || true
+	systemctl stop monitor-agent-uninstall.service 2>/dev/null || true
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
 	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
+	rm -f "$UNINSTALL_HELPER" "$UNINSTALL_UNIT" "$UNINSTALL_PATH"
 	rm -f "$AGENT_DIR/monitor-agent" "$AGENT_DIR/monitor-agent.previous" \
 		"$AGENT_DIR/monitor-agent.backup" "$AGENT_DIR/monitor-agent.download" \
 		"$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp"
+	rm -f "$AGENT_DIR/uninstall.json" "$AGENT_DIR/uninstall.tmp"
 	rmdir "$AGENT_DIR" 2>/dev/null || true
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
@@ -260,7 +267,8 @@ esac
 URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
 STAGED_BIN="$ROOT/.monitor-agent.install.$$"
-trap 'rm -f "$TMP" "$STAGED_BIN"' EXIT
+STAGED_HELPER="$ROOT/.agent-uninstall.install.$$"
+trap 'rm -f "$TMP" "$STAGED_BIN" "$STAGED_HELPER"' EXIT
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -324,6 +332,16 @@ case "$ARCH:$(od -An -tu2 -j18 -N2 "$TMP" | tr -d ' ')" in
 x86_64:62 | aarch64:183) ;;
 *) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
 esac
+
+# Only a binary that implements the fixed helper protocol can enable this
+# capability. Installing a prior release must not advertise a broken helper.
+REMOTE_UNINSTALL=""
+if [ "$INIT" = systemd ]; then
+	chmod 0755 "$TMP"
+	if [ "$("$TMP" --uninstall-protocol 2>/dev/null || true)" = 1 ]; then
+		REMOTE_UNINSTALL=1
+	fi
+fi
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -402,6 +420,10 @@ else
 	}
 fi
 install -d -m 0755 "$ROOT"
+chown root "$ROOT"
+if [ "$INIT" = systemd ]; then
+	systemctl disable --now monitor-agent-uninstall.path 2>/dev/null || true
+fi
 # This user can replace its own executable, but cannot write the hub, the
 # root-only env file, or a service definition. current_exe() resolves through
 # the root-owned symlink at the documented binary path into this directory.
@@ -419,7 +441,18 @@ mv -fT "$STAGED_BIN" "$AGENT_DIR/monitor-agent"
 # A manual install supersedes any interrupted self-update.
 rm -f "$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp" \
 	"$AGENT_DIR/monitor-agent.previous" "$AGENT_DIR/monitor-agent.backup" "$AGENT_DIR/monitor-agent.download"
+rm -f "$AGENT_DIR/uninstall.json" "$AGENT_DIR/uninstall.tmp"
 ln -sfn "$AGENT_DIR/monitor-agent" "$BIN"
+
+if [ -n "$REMOTE_UNINSTALL" ]; then
+	# This copy and its parent remain root-owned. Never execute the agent's
+	# self-updateable binary as root, nor give the normal service sudo access.
+	install -m 0755 "$TMP" "$STAGED_HELPER"
+	chown root "$STAGED_HELPER"
+	mv -fT "$STAGED_HELPER" "$UNINSTALL_HELPER"
+else
+	rm -f "$UNINSTALL_HELPER" "$UNINSTALL_UNIT" "$UNINSTALL_PATH"
+fi
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -433,6 +466,8 @@ MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 MONITOR_ALLOW_UPGRADE=1
 ENV
+	[ -z "$REMOTE_UNINSTALL" ] || printf 'MONITOR_ALLOW_UNINSTALL=1\n' >>"$ENV_FILE"
+	[ -z "$INSECURE" ] || printf 'MONITOR_INSECURE=1\n' >>"$ENV_FILE"
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
 
@@ -494,6 +529,33 @@ RC
 	exit 0
 fi
 
+if [ -n "$REMOTE_UNINSTALL" ]; then
+	cat >"$UNINSTALL_UNIT" <<UNIT
+[Unit]
+Description=Uninstall monitor agent on an authorized hub request
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=$ENV_FILE
+ExecStart=$UNINSTALL_HELPER --uninstall-helper
+TimeoutStartSec=240
+UMask=0077
+UNIT
+	cat >"$UNINSTALL_PATH" <<UNIT
+[Unit]
+Description=Watch for monitor agent uninstall requests
+
+[Path]
+PathExists=$AGENT_DIR/uninstall.json
+Unit=monitor-agent-uninstall.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+fi
+
 cat >"$UNIT_FILE" <<UNIT
 [Unit]
 Description=monitor agent
@@ -532,6 +594,9 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
+if [ -n "$REMOTE_UNINSTALL" ]; then
+	systemctl enable --now monitor-agent-uninstall.path
+fi
 systemctl enable monitor-agent >/dev/null
 # restart rather than `enable --now`: --now leaves an already-running service
 # untouched, so reinstalling over a live agent would keep the old binary

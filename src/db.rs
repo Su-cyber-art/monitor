@@ -230,6 +230,18 @@ CREATE TABLE IF NOT EXISTS agent_upgrade (
   started_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- Kept after the node is removed so the administrator can read the result.
+CREATE TABLE IF NOT EXISTS agent_removal (
+  node_id INTEGER PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE,
+  node_name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  message TEXT NOT NULL DEFAULT '',
+  started_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  dismissed INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
@@ -246,7 +258,7 @@ CREATE TABLE IF NOT EXISTS agent_upgrade (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -435,6 +447,21 @@ fn migrate_to_14(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_15(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_removal (
+           node_id INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, node_name TEXT NOT NULL,
+           status TEXT NOT NULL, message TEXT NOT NULL DEFAULT '',
+           started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_16(conn: &Connection) -> Result<()> {
+    add_column(conn, "agent_removal", "dismissed INTEGER NOT NULL DEFAULT 0")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -490,13 +517,19 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 14 {
         migrate_to_14(&tx)?;
     }
+    if from < 15 {
+        migrate_to_15(&tx)?;
+    }
+    if from < 16 {
+        migrate_to_16(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
 /// Every table this build keeps.
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 12] = [
     "setting",
     "node",
     "traffic",
@@ -508,10 +541,11 @@ const TABLES: [&str; 11] = [
     "metric_hour",
     "ping_hour",
     "agent_upgrade",
+    "agent_removal",
 ];
 
 /// Tables added after v1.0.0. The migrations create them when restoring an old backup.
-const ADDED_TABLES: [&str; 3] = ["metric_hour", "ping_hour", "agent_upgrade"];
+const ADDED_TABLES: [&str; 4] = ["metric_hour", "ping_hour", "agent_upgrade", "agent_removal"];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1317,12 +1351,25 @@ impl Db {
 
     /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        anyhow::ensure!(
+            !tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM agent_removal WHERE node_id=?1
+             AND status IN ('queued', 'accepted', 'stopping', 'removing'))",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )?,
+            "节点正在卸载，请等待结果后再删除记录"
+        );
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
         // for the chart query -- so it is cleared explicitly; the other history
         // tables cascade.
-        conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
-        Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
+        tx.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+        let deleted = tx.execute("DELETE FROM node WHERE id = ?1", [id])? > 0;
+        tx.execute("DELETE FROM agent_removal WHERE node_id = ?1", [id])?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Replaces a node's token, which immediately locks out the old one. False
@@ -2650,7 +2697,9 @@ impl Db {
     pub fn start_agent_upgrade(&self, node: i64, id: &str, version: &str, now: i64) -> Result<bool> {
         Ok(self.conn().execute(
             "INSERT INTO agent_upgrade (node_id, id, version, status, started_at, updated_at)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?4)
+             SELECT ?1, ?2, ?3, 'queued', ?4, ?4
+             WHERE NOT EXISTS (SELECT 1 FROM agent_removal WHERE node_id=?1
+               AND status IN ('queued', 'accepted', 'stopping', 'removing', 'unconfirmed'))
              ON CONFLICT(node_id) DO UPDATE SET id=excluded.id, version=excluded.version,
                status='queued', message='', started_at=excluded.started_at, updated_at=excluded.updated_at
              WHERE agent_upgrade.status IN ('succeeded', 'failed')",
@@ -2687,6 +2736,174 @@ impl Db {
             "UPDATE agent_upgrade SET status='failed', message='升级超时，未收到新版本的连接确认', updated_at=?1
              WHERE status IN ('queued', 'downloading', 'restarting') AND started_at<=?2",
             params![now, now - crate::upgrade::TIMEOUT],
+        )?;
+        Ok(())
+    }
+
+    // ---- agent removals ----
+
+    pub fn agent_removals(&self) -> Result<Vec<crate::removal::Attempt>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, id, node_name, status, message, started_at, updated_at, dismissed
+             FROM agent_removal ORDER BY started_at DESC, node_id",
+        )?;
+        let rows = stmt.query_map([], removal_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Clearing history must not erase the receipt used by a helper retrying
+    /// its final callback. Request IDs also limit clearing to what was shown.
+    pub fn dismiss_completed_removals(&self, ids: &[String]) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut cleared = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE agent_removal SET dismissed=1
+                 WHERE id=?1 AND status='succeeded' AND dismissed=0",
+            )?;
+            for id in ids {
+                cleared += stmt.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(cleared)
+    }
+
+    pub fn agent_removal_active(&self, node: i64) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM agent_removal WHERE node_id=?1
+             AND status IN ('queued', 'accepted', 'stopping', 'removing'))",
+            [node],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn start_agent_removal(&self, node: i64, id: &str, now: i64) -> Result<crate::removal::Start> {
+        use crate::removal::Start;
+        let conn = self.conn();
+        let name: Option<String> =
+            conn.query_row("SELECT name FROM node WHERE id=?1", [node], |r| r.get(0)).optional()?;
+        let Some(name) = name else { return Ok(Start::Missing) };
+        let previous = conn
+            .query_row(
+                "SELECT node_id, id, node_name, status, message, started_at, updated_at, dismissed
+             FROM agent_removal WHERE node_id=?1",
+                [node],
+                removal_row,
+            )
+            .optional()?;
+        if let Some(attempt) = previous {
+            match attempt.status.as_str() {
+                "unconfirmed" => return Ok(Start::Unconfirmed),
+                "succeeded" | "failed" => {}
+                _ => return Ok(Start::Ready { fresh: false, attempt }),
+            }
+        }
+        if conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM agent_upgrade WHERE node_id=?1
+             AND status IN ('queued', 'downloading', 'restarting'))",
+            [node],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(Start::Upgrading);
+        }
+        conn.execute(
+            "INSERT INTO agent_removal (node_id, id, node_name, status, started_at, updated_at)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?4)
+             ON CONFLICT(node_id) DO UPDATE SET id=excluded.id, node_name=excluded.node_name,
+               status='queued', message='', started_at=excluded.started_at, updated_at=excluded.updated_at,
+               dismissed=0",
+            params![node, id, name, now],
+        )?;
+        Ok(Start::Ready {
+            fresh: true,
+            attempt: crate::removal::Attempt {
+                node_id: node,
+                id: id.into(),
+                node_name: name,
+                status: "queued".into(),
+                message: String::new(),
+                started_at: now,
+                updated_at: now,
+                dismissed: false,
+            },
+        })
+    }
+
+    pub fn agent_removal_progress(&self, node: i64, id: &str, status: &str, message: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agent_removal SET status=?3, message=?4, updated_at=?5
+             WHERE node_id=?1 AND id=?2 AND (
+               (?3='accepted' AND status='queued') OR
+               (?3='failed' AND status IN ('queued', 'accepted')))",
+            params![node, id, status, message, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Receipt of the helper's success and deletion of all node history commit
+    /// together. The retained result also makes a retried final callback safe.
+    pub fn confirm_agent_removal(
+        &self,
+        id: &str,
+        status: &str,
+        message: &str,
+        node_token: Option<&str>,
+    ) -> Result<Option<(i64, bool)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let job: Option<(i64, String)> = tx
+            .query_row("SELECT node_id, status FROM agent_removal WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((node, previous)) = job else { return Ok(None) };
+        if previous == "succeeded" && status == "succeeded" {
+            return Ok(Some((node, false)));
+        }
+        let allowed = match status {
+            "stopping" => matches!(previous.as_str(), "queued" | "accepted" | "stopping"),
+            "removing" => matches!(previous.as_str(), "stopping" | "removing" | "unconfirmed"),
+            "succeeded" => matches!(previous.as_str(), "stopping" | "removing" | "unconfirmed"),
+            "failed" => !matches!(previous.as_str(), "succeeded" | "failed"),
+            _ => false,
+        };
+        if !allowed {
+            return Ok(None);
+        }
+        if status == "stopping"
+            && !tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM node WHERE id=?1 AND token=?2)",
+                params![node, node_token],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
+            return Ok(None);
+        }
+        let completed = status == "succeeded";
+        if completed {
+            tx.execute("DELETE FROM ping_record WHERE node_id=?1", [node])?;
+            tx.execute("DELETE FROM node WHERE id=?1", [node])?;
+        }
+        tx.execute(
+            "UPDATE agent_removal SET status=?2, message=?3, updated_at=?4 WHERE id=?1",
+            params![id, status, message, Utc::now().timestamp()],
+        )?;
+        tx.commit()?;
+        Ok(Some((node, completed)))
+    }
+
+    pub fn expire_agent_removals(&self, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agent_removal SET
+               message=CASE WHEN status IN ('queued', 'accepted') THEN '卸载超时，未收到辅助服务确认；节点记录已保留'
+                 ELSE '未收到卸载完成回执，节点可能已部分卸载；请在节点检查，主控记录暂时保留' END,
+               status=CASE WHEN status IN ('queued', 'accepted') THEN 'failed' ELSE 'unconfirmed' END,
+               updated_at=?1
+             WHERE status IN ('queued', 'accepted', 'stopping', 'removing') AND started_at<=?2",
+            params![now, now - crate::removal::TIMEOUT],
         )?;
         Ok(())
     }
@@ -2759,6 +2976,19 @@ impl Db {
         self.conn().execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
         Ok(())
     }
+}
+
+fn removal_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::removal::Attempt> {
+    Ok(crate::removal::Attempt {
+        node_id: r.get(0)?,
+        id: r.get(1)?,
+        node_name: r.get(2)?,
+        status: r.get(3)?,
+        message: r.get(4)?,
+        started_at: r.get(5)?,
+        updated_at: r.get(6)?,
+        dismissed: r.get(7)?,
+    })
 }
 
 /// Turns one finished bucket into a row per probe, stamped with the bucket's

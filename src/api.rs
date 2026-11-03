@@ -303,6 +303,7 @@ fn node_view(
     // all: the panel reads it from `node_token` as it shows the install command.
     if full {
         view["can_upgrade"] = json!(current.is_some_and(|agent| agent.can_upgrade));
+        view["can_uninstall"] = json!(current.is_some_and(|agent| agent.can_uninstall));
         let held = (node.ipv4.as_str(), node.ipv6.as_str());
         let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
         let exits = [node.ip.as_str(), node.ip_other.as_str()];
@@ -1274,11 +1275,24 @@ pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Jso
 }
 
 pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    if let Err(e) = app.db.expire_agent_removals(Utc::now().timestamp()) {
+        return fail(e);
+    }
+    match app.db.agent_removal_active(id) {
+        Ok(true) => return answer(StatusCode::CONFLICT, "节点正在卸载，请等待结果后再删除记录"),
+        Ok(false) => {}
+        Err(e) => return fail(e),
+    }
     match app.db.delete_node(id) {
         Ok(true) => {}
         Ok(false) => return no_such_node(),
         Err(e) => return fail(e),
     }
+    forget_node(&app, id);
+    Json(json!({"ok": true})).into_response()
+}
+
+pub(crate) fn forget_node(app: &App, id: i64) {
     // The token is checked only at the handshake, so deleting the row does not
     // end a connection already open on it; dropping the sender does. Dropped
     // after the delete, so the reconnect that follows finds no token to accept.
@@ -1286,8 +1300,7 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     // Its held reading as well, which no node would book.
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    invalidate_snapshot(&app);
-    Json(json!({"ok": true})).into_response()
+    invalidate_snapshot(app);
 }
 
 /// Issues a fresh token, invalidating the old one immediately.
@@ -3011,6 +3024,7 @@ mod tests {
             "token",
             "interval",
             "can_upgrade",
+            "can_uninstall",
         ] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
