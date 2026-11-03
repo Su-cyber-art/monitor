@@ -30,6 +30,7 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod platform;
 mod upgrade;
 #[cfg(test)]
 mod upgrade_e2e;
@@ -172,6 +173,14 @@ pub const AGENT_REPO: &str = "Su-cyber-art/agent";
 pub const HUB_REPO: &str = "Su-cyber-art/monitor";
 
 /// The one-line installer pasted onto a new VPS.
+async fn install_windows() -> Response {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], include_str!("../install.ps1")).into_response()
+}
+
+async fn install_macos() -> Response {
+    ([(header::CONTENT_TYPE, "text/x-shellscript")], include_str!("../install-macos.sh")).into_response()
+}
+
 async fn install_script() -> Response {
     ([(header::CONTENT_TYPE, "text/x-shellscript")], include_str!("../install.sh")).into_response()
 }
@@ -185,12 +194,10 @@ async fn install_script() -> Response {
 /// path. It remains within the bounds `agent_binary` already enforces: four
 /// concurrent transfers, a response within [`RELAY_HEAD`], a capped body and a
 /// signature.
-fn release_url(app: &App, arch: &str, version: Option<&str>) -> String {
+fn release_url(app: &App, os: &str, arch: &str, version: Option<&str>) -> String {
     let release = version.map_or_else(|| "latest/download".to_owned(), |v| format!("download/v{v}"));
-    proxied(
-        app,
-        format!("https://github.com/{AGENT_REPO}/releases/{release}/monitor-agent-{arch}-unknown-linux-musl"),
-    )
+    let asset = platform::asset(os, arch).expect("validated agent platform");
+    proxied(app, format!("https://github.com/{AGENT_REPO}/releases/{release}/{asset}"))
 }
 
 /// Places the panel's GitHub proxy in front of a github.com URL when one is
@@ -301,18 +308,9 @@ fn signed(key: &[u8], binary: &[u8], signature: &[u8]) -> bool {
     UnparsedPublicKey::new(&ED25519, key).verify(binary, signature).is_ok()
 }
 
-/// Whether `binary` is an ELF executable for `arch`. A signature covers the
-/// bytes alone, so a mirror could answer one architecture's request with the
-/// other's signed binary, and `install.sh` would replace a running agent with
-/// one that cannot start.
-fn built_for(binary: &[u8], arch: &str) -> bool {
-    let machine: u16 = if arch == "aarch64" { 183 } else { 62 };
-    binary.get(18..20).is_some_and(|m| u16::from_le_bytes([m[0], m[1]]) == machine)
-}
-
-/// Whether the hub may hand `binary` to `install.sh` on an `arch` machine.
-fn relayable(key: &[u8], binary: &[u8], signature: &[u8], arch: &str) -> bool {
-    signed(key, binary, signature) && built_for(binary, arch)
+/// A valid signature must also match the requested OS and architecture.
+fn relayable(key: &[u8], binary: &[u8], signature: &[u8], os: &str, arch: &str) -> bool {
+    signed(key, binary, signature) && platform::built_for(binary, os, arch)
 }
 
 /// One GET of a release asset, whole, refused past `max` bytes.
@@ -373,6 +371,7 @@ impl futures_core::Stream for Once {
 /// release's, so an agent release needs no hub release.
 #[derive(serde::Deserialize)]
 struct AgentRelease {
+    os: Option<String>,
     version: Option<String>,
 }
 
@@ -385,8 +384,9 @@ async fn agent_binary(
 }
 
 async fn relay_agent(app: Shared, arch: String, release: AgentRelease, signing_key: &[u8]) -> Response {
-    if !matches!(arch.as_str(), "x86_64" | "aarch64") {
-        return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
+    let os = release.os.as_deref().unwrap_or("linux");
+    if platform::asset(os, &arch).is_none() {
+        return api::answer(StatusCode::NOT_FOUND, "unsupported agent platform");
     }
     if release.version.as_deref().is_some_and(|version| !upgrade::valid_version(version)) {
         return api::answer(StatusCode::BAD_REQUEST, "invalid agent version");
@@ -395,7 +395,7 @@ async fn relay_agent(app: Shared, arch: String, release: AgentRelease, signing_k
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
         return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
     };
-    let url = release_url(&app, &arch, release.version.as_deref());
+    let url = release_url(&app, os, &arch, release.version.as_deref());
     let sig = format!("{url}.sig");
     // English, as `install.sh` prints it after its own English line.
     let fetched = async {
@@ -403,7 +403,7 @@ async fn relay_agent(app: Shared, arch: String, release: AgentRelease, signing_k
             fetch_asset(&app, &url, "agent binary", MAX_AGENT_BINARY),
             fetch_asset(&app, &sig, "agent signature", 64),
         )?;
-        if !relayable(signing_key, &binary, &signature, &arch) {
+        if !relayable(signing_key, &binary, &signature, os, &arch) {
             warn!("{url} does not match its signature or architecture; not relayed");
             return Err(
                 "the agent binary failed its signature check, so the hub refused to relay it".to_owned()
@@ -707,6 +707,8 @@ async fn main() -> Result<()> {
                 .route("/api/agent/echo", get(agent_ws::echo))
                 .route("/api/agent/register", post(api::agent_register))
                 .route("/install.sh", get(install_script))
+                .route("/install.ps1", get(install_windows))
+                .route("/install-macos.sh", get(install_macos))
                 .route("/agent/{arch}", get(agent_binary))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
@@ -1111,15 +1113,19 @@ mod tests {
         assert!(!signed(&AGENT_SIGNING_KEY, &binary, signature.as_ref()), "another key's signature");
         assert!(!signed(key, &binary, &[]), "no signature");
         let mut elf = vec![0u8; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
         elf[18] = 62;
-        assert!(built_for(&elf, "x86_64") && !built_for(&elf, "aarch64"), "the other architecture's binary");
+        assert!(
+            platform::built_for(&elf, "linux", "x86_64") && !platform::built_for(&elf, "linux", "aarch64"),
+            "the other architecture's binary"
+        );
 
         // Relayed only with both: the signature alone passes the other
         // architecture's signed binary, the architecture alone a replaced one.
         let elf_signature = pair.sign(&elf);
-        assert!(relayable(key, &elf, elf_signature.as_ref(), "x86_64"));
-        assert!(!relayable(key, &elf, elf_signature.as_ref(), "aarch64"));
-        assert!(!relayable(key, &elf, signature.as_ref(), "x86_64"));
+        assert!(relayable(key, &elf, elf_signature.as_ref(), "linux", "x86_64"));
+        assert!(!relayable(key, &elf, elf_signature.as_ref(), "linux", "aarch64"));
+        assert!(!relayable(key, &elf, signature.as_ref(), "linux", "x86_64"));
     }
 
     /// The limit only moves up, so raising it here cannot disturb another test.
@@ -1431,19 +1437,44 @@ mod tests {
     #[test]
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
-        let direct = release_url(&app, "x86_64", None);
+        let direct = release_url(&app, "linux", "x86_64", None);
         assert!(direct.starts_with("https://github.com/Su-cyber-art/agent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();
-            assert_eq!(release_url(&app, "x86_64", None), format!("https://ghfast.top/{direct}"), "{set:?}");
+            assert_eq!(
+                release_url(&app, "linux", "x86_64", None),
+                format!("https://ghfast.top/{direct}"),
+                "{set:?}"
+            );
         }
         // Cleared in the panel, which stores an empty string rather than removing
         // the row.
         app.db.set("github_proxy", "").unwrap();
-        assert_eq!(release_url(&app, "x86_64", None), direct);
-        assert!(release_url(&app, "aarch64", Some("1.3.0"))
+        assert_eq!(release_url(&app, "linux", "x86_64", None), direct);
+        assert!(release_url(&app, "linux", "aarch64", Some("1.3.0"))
             .contains("/releases/download/v1.3.0/monitor-agent-aarch64-"));
+        assert!(release_url(&app, "windows", "x86_64", Some("1.4.0"))
+            .ends_with("/v1.4.0/monitor-agent-x86_64-pc-windows-msvc.exe"));
+        assert!(release_url(&app, "macos", "aarch64", None)
+            .ends_with("/latest/download/monitor-agent-aarch64-apple-darwin"));
+    }
+
+    #[tokio::test]
+    async fn unknown_platforms_are_rejected_before_fetching_a_release() {
+        let app = Arc::new(app(""));
+        for (os, arch) in [("windows", "../x86_64"), ("darwin", "x86_64"), ("../linux", "aarch64")] {
+            let response = relay_agent(
+                app.clone(),
+                arch.into(),
+                AgentRelease { os: Some(os.into()), version: None },
+                &AGENT_SIGNING_KEY,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        let old: AgentRelease = serde_json::from_str("{}").unwrap();
+        assert!(old.os.is_none(), "old installers continue to request Linux");
     }
 
     #[test]

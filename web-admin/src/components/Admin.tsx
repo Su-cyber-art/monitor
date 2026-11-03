@@ -16,7 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { agentCommand, agentPlatform, type AgentPlatform, api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1205,51 +1205,36 @@ function BillingForm({ node, onClose, onSaved }: {
   )
 }
 
-// Each command runs the hub's own install.sh and is offered only on an https
-// domain entry. `args` receives that entry, which the agent is also given as
-// --server.
-function scriptCommand(site: string, args: (site: string) => string[]) {
-  site = provisioningSite(site)
-  return site && `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).join(" ")}`
+// Viewing a command only reads credentials; it never rotates a node token.
+function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined, platform: AgentPlatform) {
+  return agentCommand(site, platform, ["--server", provisioningSite(site), "--token", token, ...intervalArg(seconds), ...ifaceArg(iface)])
 }
 
-// Built here rather than fetched: the install dialog reads the token on its own,
-// so viewing an install command is a read rather than an action. Reissuing one to
-// display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
-}
-
-// Left out untouched, as an untouched --iface is: a rerun then keeps what the
-// machine already has.
 function intervalArg(seconds: number | undefined) {
-  return seconds === undefined ? [] : [`--interval ${seconds}`]
+  return seconds === undefined ? [] : ["--interval", String(seconds)]
 }
 
-// '' is how install.sh is told to clear a value it would otherwise keep; a
-// name needs no quoting, as ifaceSpec admits no shell metacharacter.
 function ifaceArg(iface: string | undefined) {
-  return iface === undefined ? [] : [`--iface ${iface || "''"}`]
+  return iface === undefined ? [] : ["--iface", iface]
 }
 
-// One command for a batch of machines. The key belongs to the hub, is valid only
-// within the window it opened, and each machine exchanges it for a token of its
-// own, so unlike an install command this text is no one's credential and can be
-// sent to every machine as it is.
-function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, platform: AgentPlatform) {
+  return agentCommand(site, platform, ["--server", provisioningSite(site), "--register", key, ...intervalArg(seconds), ...ifaceArg(iface)])
 }
 
-// Carries no token, so it is the same for every node and remains valid after the
-// node is deleted.
-function uninstallCommand(site: string) {
-  return scriptCommand(site, () => ["--uninstall"])
-}
-
-// Also the same for every node: install.sh reads the token and the hub address
-// from the machine's own env file.
-function upgradeCommand(site: string) {
-  return scriptCommand(site, () => ["--upgrade"])
+function PlatformOption({ value, onChange }: { value: AgentPlatform; onChange: (platform: AgentPlatform) => void }) {
+  return (
+    <OptionRow title="目标系统" hint={value === "windows" ? "在目标机器的管理员 PowerShell 中执行" : "在目标机器上以 root 执行"}>
+      <Select value={value} onValueChange={(value) => onChange(value as AgentPlatform)}>
+        <SelectTrigger className="w-36" aria-label="目标系统"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          <SelectItem value="linux">Linux</SelectItem>
+          <SelectItem value="windows">Windows</SelectItem>
+          <SelectItem value="macos">macOS</SelectItem>
+        </SelectContent>
+      </Select>
+    </OptionRow>
+  )
 }
 
 export type Versions = { hub: string; hub_latest: string; agent_latest: string; notice: boolean }
@@ -1335,9 +1320,10 @@ function RegisterDialog({ site, reg, onClose }: {
   reg: ReturnType<typeof useRegisterWindow>
   onClose: () => void
 }) {
-  const iface = useIfaceOption(undefined)
+  const [platform, setPlatform] = useState<AgentPlatform>("linux")
+  const iface = useIfaceOption(undefined, platform)
   const interval = useIntervalOption()
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag) : ""
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, platform) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -1354,6 +1340,7 @@ function RegisterDialog({ site, reg, onClose }: {
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <PlatformOption value={platform} onChange={setPlatform} />
             <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
           </section>
@@ -1365,7 +1352,7 @@ function RegisterDialog({ site, reg, onClose }: {
               </Command>
               {/* Per machine, so it cannot be part of the one command. */}
               <p className="text-xs leading-relaxed text-muted-foreground">
-                要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
+                要给某台单独起名，在它执行的命令末尾加 <code>{platform === "windows" ? "-Name 名字" : "--name 名字"}</code>，只对新建的节点生效。
                 <a
                   className="ml-1 underline underline-offset-2 hover:text-foreground"
                   href="https://monitor-document.pages.dev/install/batch"
@@ -1436,12 +1423,12 @@ function IntervalOption({ option, batch = false }: { option: ReturnType<typeof u
 // empty passes '' and restores the default rules. It opens on for a node whose
 // agent reports a list, so reinstalling from here repeats that list rather than
 // relying on the machine to remember it.
-function useIfaceOption(current: string | undefined) {
+function useIfaceOption(current: string | undefined, platform: AgentPlatform) {
   const [on, setOn] = useState(!!current)
   const [choice, setChoice] = useState<IfaceChoice>(() => ifaceChoice(current ?? ""))
-  const bad = on ? badIfaceName(choice) : undefined
-  const spec = ifaceSpec(choice)
-  return { on, setOn, choice, setChoice, current, bad, valid: !bad, flag: on && spec !== null ? spec : undefined }
+  const bad = on ? badIfaceName(choice, platform) : undefined
+  const spec = ifaceSpec(choice, platform)
+  return { on, setOn, choice, setChoice, current, platform, bad, valid: !bad, flag: on && spec !== null ? spec : undefined }
 }
 
 function describeIface(spec: string) {
@@ -1475,8 +1462,8 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
       below={on && (
         <div className="space-y-2.5">
           <div className="grid gap-3 sm:grid-cols-2">
-            {field("only", "只统计", "如 WAN 口 eth1 或 pppoe-wan")}
-            {field("skip", "不统计", "如 LAN 口 eth0")}
+            {field("only", "只统计", option.platform === "windows" ? "如 Ethernet 2 或 Wi-Fi" : "如 eth1、en0 或 pppoe-wan")}
+            {field("skip", "不统计", option.platform === "windows" ? "如 vEthernet (WSL)" : "如 LAN 口 eth0")}
           </div>
           <p className={`text-xs leading-relaxed ${bad ? "text-destructive" : "text-muted-foreground"}`}>
             {bad
@@ -1501,7 +1488,8 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [unread, setUnread] = useState("")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
-  const iface = useIfaceOption(currentIface(node))
+  const [platform, setPlatform] = useState<AgentPlatform>(() => agentPlatform(node.os))
+  const iface = useIfaceOption(currentIface(node), platform)
   const interval = useIntervalOption(node.interval)
 
   // Read as the dialog opens rather than carried in the node list, where it
@@ -1515,7 +1503,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
     return () => { live = false }
   }, [node.id])
 
-  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
+  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag, platform) : ""
   const placeholder = token ? "网卡名有误，改正后显示命令" : unread ? `读取凭证失败：${unread}` : "正在读取凭证…"
 
   async function rotate() {
@@ -1549,6 +1537,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <PlatformOption value={platform} onChange={setPlatform} />
             <IntervalOption option={interval} />
             <IfaceOption option={iface} />
           </section>
@@ -1672,7 +1661,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     added.current = null
   })
   const searching = query.trim() !== "" || group !== "all"
-  const uninstall = refusal ? "" : uninstallCommand(site)
+  const uninstall = refusal ? "" : agentCommand(site, agentPlatform(deleting?.os ?? ""), ["--uninstall"])
 
   async function remove() {
     if (!deleting) return
@@ -1899,7 +1888,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
               </div>
               <Command>{uninstall}</Command>
               <p className="text-xs text-muted-foreground">
-                在这台机器上以 root 执行，停止 agent，删除二进制、env 文件和服务文件。
+                {agentPlatform(deleting.os) === "windows" ? "在管理员 PowerShell 中执行" : "在这台机器上以 root 执行"}，停止 agent 并删除程序、凭证和服务文件。
               </p>
             </div>
           )}
@@ -3719,11 +3708,12 @@ function Update({ versions, reload, nodes, site, refusal }: {
   refusal: string
 }) {
   const [saving, setSaving] = useState(false)
+  const [platform, setPlatform] = useState<AgentPlatform>("linux")
   if (!versions) return null
   const outdated = outdatedAgents(nodes, versions.agent_latest)
   const bootstrap = outdated.filter((node) => !node.can_upgrade)
   const offline = outdated.filter((n) => !n.online).length
-  const upgrade = refusal ? "" : upgradeCommand(site)
+  const upgrade = refusal ? "" : agentCommand(site, platform, ["--upgrade"])
   const unreachable = !versions.hub_latest && !versions.agent_latest
 
   // Applied on the spot: one switch, and the navigation changes with it.
@@ -3784,6 +3774,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
             </p>
             {upgrade ? (
               <>
+                <PlatformOption value={platform} onChange={setPlatform} />
                 <Command>{upgrade}</Command>
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" variant="secondary" onClick={() => copy(upgrade)}>

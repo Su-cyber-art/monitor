@@ -1,6 +1,7 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { spawnSync } from "node:child_process"
+import { agentCommand, agentPlatform, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -130,3 +131,36 @@ assert.deepEqual(
   [["通用", ["a"]], ["外观", ["b"]]],
 )
 
+
+// Platform selection and shell quoting keep adapter names literal.
+assert.equal(agentPlatform("Microsoft Windows 11"), "windows")
+assert.equal(agentPlatform("macOS 15.0"), "macos")
+assert.equal(agentPlatform("Ubuntu 24.04"), "linux")
+assert.equal(ifaceSpec({ only: "Ethernet 2,vEthernet (WSL)", skip: "Wi-Fi" }, "windows"), "Ethernet 2,vEthernet (WSL),-Wi-Fi")
+assert.equal(ifaceSpec({ only: "Ethernet 2", skip: "" }), null)
+const winCommand = agentCommand("https://monitor.example.com", "windows", ["--server", "https://monitor.example.com", "--token", "abc", "--iface", "Ethernet 2,O'Reilly $(test)"])
+assert.ok(winCommand.includes("/install.ps1"))
+assert.ok(winCommand.includes("-Iface 'Ethernet 2,O''Reilly $(test)'"))
+assert.ok(agentCommand("https://monitor.example.com", "windows", ["--iface", ""]).endsWith("-Iface ''"))
+assert.ok(agentCommand("https://monitor.example.com", "macos", ["--upgrade"]).includes("/install-macos.sh"))
+assert.equal(agentCommand("http://monitor.example.com", "windows", ["--upgrade"]), "")
+
+if (process.platform === "win32") {
+  // Execute the generated command against an inert installer, so PowerShell's
+  // own parser checks quoting, switches, spaces and clearing a saved value.
+  const mock = `function Invoke-WebRequest {
+    param($Uri, [switch]$UseBasicParsing)
+    [pscustomobject]@{ Content = @'
+param([string]$Server, [string]$Token, [AllowEmptyString()][string]$Iface, [switch]$Upgrade)
+$PSBoundParameters | ConvertTo-Json -Compress
+'@ }
+  }\n`
+  for (const iface of ["", "Ethernet 2,O'Reilly $(throw 'must not run')"]) {
+    const command = agentCommand("https://monitor.example.com", "windows", ["--server", "https://monitor.example.com", "--token", "literal-token", "--iface", iface])
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", mock + command], { encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+    const received = JSON.parse(result.stdout)
+    assert.equal(received.Iface, iface)
+    assert.equal(received.Token, "literal-token")
+  }
+}

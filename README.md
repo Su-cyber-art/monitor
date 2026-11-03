@@ -16,12 +16,12 @@
 | 仓库 | 说明 |
 |---|---|
 | [monitor](https://github.com/Su-cyber-art/monitor) | hub：后台、API、公开页宿主 |
-| [agent](https://github.com/Su-cyber-art/agent) | Linux agent |
+| [agent](https://github.com/Su-cyber-art/agent) | Linux / Windows / macOS agent |
 | [monitor-theme-default](https://github.com/monitor-probe/monitor-theme-default) | 内置默认主题 |
 | [themes](https://github.com/monitor-probe/themes) | 主题站：收录第三方主题，提供在线预览 |
 
 ```
-agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
+agent (Linux / Windows / macOS)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
 ```
 
 ## 后台界面
@@ -58,3 +58,14 @@ sh scripts/e2e-upgrade.sh /absolute/old/monitor-agent /absolute/new/monitor-agen
 ```
 
 该测试使用临时主控和测试签名验证真实进程的批量替换、持续上报、失败保留和服务重启回退，不需要生产发布私钥。
+
+## 跨平台探针
+
+hub v1.8.0 配合 agent v1.4.0 起，面板安装、批量添加与手动升级提供 Linux、Windows、macOS 选择。Windows 在管理员 PowerShell 执行；macOS 和 Linux 以 root 执行。既有节点按上报的系统预选安装命令，卸载命令也随系统变化。
+
+- Linux 继续使用 `/install.sh` 与 `/agent/{arch}`，兼容已有安装和升级命令。
+- Windows 使用 `/install.ps1`，下载 `/agent/{arch}?os=windows`，运行原生 Windows 服务。
+- macOS 使用 `/install-macos.sh`，下载 `/agent/{arch}?os=macos`，运行 launchd 服务。
+- `arch` 为 `x86_64` 或 `aarch64`。下载中转同时校验发布签名与 ELF / PE / Mach-O 平台头，指定版本仍使用 `version` 查询参数。
+
+上线时需要发布配套 agent 仓库中的六个系统/架构构建及 `.sig` 签名，再部署本主控；旧版仅有 Linux 产物的 release 无法提供 Windows/macOS 下载。主控自身仍部署在 Linux。

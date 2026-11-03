@@ -49,7 +49,7 @@ jobs:
       # Both installers run as root on the user's machine. Notes below warning
       # level are all SC2015 on `[ a ] && [ b ] || die`, which is meant to die
       # when either test fails.
-      - run: shellcheck -S warning install.sh install-hub.sh scripts/*.sh
+      - run: shellcheck -S warning install.sh install-macos.sh install-hub.sh scripts/*.sh
 
       # This commit's hub against the latest released agent: the field contract
       # between the two repositories, and what the public view withholds.
@@ -58,3 +58,22 @@ jobs:
           curl -fsSL -o agent https://github.com/Su-cyber-art/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
           chmod +x agent
       - run: scripts/e2e.sh target/debug/monitor-hub ./agent
+
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web-admin/package-lock.json
+      - run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) > $null
+          if ($errors) { $errors | Format-List; exit 1 }
+      - run: npm ci
+        working-directory: web-admin
+      - run: npm test
+        working-directory: web-admin

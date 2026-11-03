@@ -330,24 +330,46 @@ export function outdatedAgents<T extends { agent_version: string }>(nodes: T[], 
 /** The agent's `--iface` as the install dialogs edit it: names to count alone, names to leave out. */
 export type IfaceChoice = { only: string; skip: string }
 
-// What the agent accepts as a name, less the leading `-` that marks an exclusion
-// in the flag itself. Narrower than a kernel interface name, and within what
-// install.sh admits into the env file OpenRC sources as shell.
+export type AgentPlatform = "linux" | "windows" | "macos"
+
+export function agentPlatform(os: string): AgentPlatform {
+  return /windows/i.test(os) ? "windows" : /macos|mac os|darwin/i.test(os) ? "macos" : "linux"
+}
+
+/** Arguments are quoted individually for the shell on the selected machine. */
+export function agentCommand(site: string, platform: AgentPlatform, args: string[]): string {
+  site = provisioningSite(site)
+  if (!site) return ""
+  if (platform === "windows") {
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
+    const flags: Record<string, string> = { "--server": "-Server", "--token": "-Token", "--register": "-Register", "--interval": "-Interval", "--iface": "-Iface", "--upgrade": "-Upgrade", "--uninstall": "-Uninstall" }
+    const command = args.map((value, index) => flags[value] && (index === 0 || !flags[args[index - 1]]) ? flags[value] : quote(value)).join(" ")
+    return `& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '${site}/install.ps1').Content)) ${command}`
+  }
+  const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`
+  const script = platform === "macos" ? "install-macos.sh" : "install.sh"
+  return `curl -fsSL '${site}/${script}' | sh -s -- ${args.map(quote).join(" ")}`
+}
+
+// Unix installer names exclude shell metacharacters; Windows uses literal
+// PowerShell arguments and JSON so adapter names may contain spaces or Unicode.
 const IFACE_NAME = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/
 
 const ifaceNames = (list: string) => list.split(",").map((n) => n.trim()).filter(Boolean)
 
 /** The first name the agent would refuse, or that would silently match nothing, and the list holding it. */
-export function badIfaceName(choice: IfaceChoice): { list: keyof IfaceChoice; name: string } | undefined {
+export function badIfaceName(choice: IfaceChoice, platform: AgentPlatform = "linux"): { list: keyof IfaceChoice; name: string } | undefined {
   for (const list of ["only", "skip"] as const) {
-    const name = ifaceNames(choice[list]).find((n) => !IFACE_NAME.test(n))
+    const name = ifaceNames(choice[list]).find((n) => platform === "windows"
+      ? n.startsWith("-") || [...n].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 || c === "*" || c === "?")
+      : !IFACE_NAME.test(n))
     if (name !== undefined) return { list, name }
   }
 }
 
 /** The `--iface` value for a choice; null while [badIfaceName] finds one. */
-export function ifaceSpec(choice: IfaceChoice): string | null {
-  if (badIfaceName(choice)) return null
+export function ifaceSpec(choice: IfaceChoice, platform: AgentPlatform = "linux"): string | null {
+  if (badIfaceName(choice, platform)) return null
   return [...ifaceNames(choice.only), ...ifaceNames(choice.skip).map((n) => `-${n}`)].join(",")
 }
 
