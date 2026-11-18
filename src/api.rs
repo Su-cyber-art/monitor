@@ -1293,10 +1293,12 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 }
 
 pub(crate) fn forget_node(app: &App, id: i64) {
-    // The token is checked only at the handshake, so deleting the row does not
-    // end a connection already open on it; dropping the sender does. Dropped
-    // after the delete, so the reconnect that follows finds no token to accept.
-    // The same reasoning applies in `reset_token` below.
+    // The token is checked at the handshake, so deleting the row does not end a
+    // connection already open on it; dropping the sender does. Dropped after the
+    // delete, so the reconnect that follows finds no token to accept, and a
+    // handshake in flight, which `agent_ws::enlist` checks again once its entry
+    // is in place, either finds none or has its entry removed here. The same
+    // order holds in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     // Its held reading as well, which no node would book.
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1314,8 +1316,8 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Ok(false) => return no_such_node(),
         Err(e) => return fail(e),
     }
-    // The token is checked only at the handshake, so a session opened with the
-    // old one would continue reporting. Dropping the sender ends that loop; the
+    // The token is checked at the handshake, so a session opened with the old
+    // one would continue reporting. Dropping the sender ends that loop; the
     // agent reconnects and is refused. Its own teardown leaves the entry
     // untouched, because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1399,6 +1401,17 @@ fn valid_target(target: &str) -> bool {
     !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
+/// The longest probe target, in bytes: a 253-character host name with its
+/// trailing dot, then `:65535`. Every target assigned to a node travels to it
+/// in one `ping.tasks` frame, which the agent refuses past 64 KiB, the same
+/// ceiling as [`MAX_FRAME`]; refused, the agent drops the session and receives
+/// the same frame on every reconnect, and the node stays offline. Control
+/// characters are refused, so a target grows at most twofold in JSON (`"` and
+/// `\` escaped), which with each task's other fields keeps a full list near
+/// 37 KB.
+const MAX_TARGET: usize = 260;
+const _: () = assert!(Db::MAX_PROBES_PER_NODE as usize * (2 * MAX_TARGET + 64) <= MAX_FRAME);
+
 pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task): Json<PingTask>) -> Response {
     // Trimmed into the stored value rather than a discarded copy: what reaches
     // the agent is `task.target`, and a trailing space from a paste passes
@@ -1412,6 +1425,14 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     }
     if task.name.chars().count() > MAX_NAME {
         return bad("名称最多 64 个字");
+    }
+    if task.target.len() > MAX_TARGET {
+        return bad(&format!("目标太长，最多 {MAX_TARGET} 字节（一个汉字占 3 字节）"));
+    }
+    // No host name holds one, and each would reach the agent escaped to six
+    // bytes, past what `MAX_TARGET` allows for.
+    if task.target.chars().any(char::is_control) {
+        return bad("目标里有不可见的字符，删掉重新输入");
     }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
@@ -1636,20 +1657,19 @@ pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
 pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
     let path = scratch_path(&app, "backup");
     // Off the runtime: this reads the entire database, through a connection of
-    // its own, so the agents' writes continue meanwhile.
-    let copied = {
-        let (app, path) = (app.clone(), path.clone());
-        tokio::task::spawn_blocking(move || app.db.backup_into(&path)).await
-    };
-    if let Err(e) = copied.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+    // its own, so the agents' writes continue meanwhile. Opened and unlinked on
+    // the same thread: a client that disconnects during the copy drops this
+    // handler, and the blocking task still removes the file.
+    let copied = tokio::task::spawn_blocking(move || {
+        let opened = app.db.backup_into(&path).and_then(|()| Ok(std::fs::File::open(&path)?));
         let _ = std::fs::remove_file(&path);
-        return fail(e);
-    }
-    let opened = tokio::fs::File::open(&path).await;
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let _ = std::fs::remove_file(&path);
-    match opened {
-        Ok(file) => (
+        let file = opened?;
+        let size = file.metadata()?.len();
+        Ok::<_, anyhow::Error>((file, size))
+    })
+    .await;
+    match copied.map_err(anyhow::Error::from).and_then(|r| r) {
+        Ok((file, size)) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
                 (header::CONTENT_LENGTH, size.to_string()),
@@ -1660,7 +1680,7 @@ pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
                     format!("attachment; filename=\"monitor-{}.db\"", Local::now().format("%Y%m%d-%H%M%S")),
                 ),
             ],
-            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))),
         )
             .into_response(),
         Err(e) => fail(e),
@@ -1716,44 +1736,42 @@ pub async fn db_restore(
         return fail(e);
     }
 
-    let outcome = restore(&app, &source).await;
-    // SQLite writes a -wal and a -shm beside any file it opens in WAL mode, and a
-    // plain copy of a running hub's database is exactly that. They are removed
-    // when the connection closes cleanly; these three lines cover the case where
-    // it does not.
-    for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
-        let _ = std::fs::remove_file(leftover);
-    }
-    match outcome {
-        Ok(()) => {
-            // Agents authenticate at the handshake, and the tokens they hold may
-            // now belong to different nodes, or to none. Dropping the senders ends
-            // those loops; each reconnects against the restored database.
-            app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
-            // Held readings belong to the database just replaced.
-            app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            invalidate_snapshot(&app);
-            let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
-                Ok(cookie) => cookie,
-                Err(e) => return fail(e),
-            };
-            with_cookies(Json(json!({"ok": true})), [cookie])
-        }
+    match restore(&app, &source).await.and_then(|()| issue_session(&app, &headers)) {
+        Ok(cookie) => with_cookies(Json(json!({"ok": true})), [cookie]),
         Err(e) => fail(e),
     }
 }
 
-async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
-    // Both halves read the whole file, off the runtime: `PRAGMA integrity_check`
-    // on a 1 GiB upload is not runtime work, and the copy that follows holds
-    // the connection the agents write through.
-    let (app, source) = (app.clone(), path.to_owned());
+/// Everything after the upload, on one blocking thread. hyper drops the handler
+/// when the client disconnects, as a proxy's read timeout does on a large
+/// restore, and shutdown drops it after `DRAIN`; a blocking task runs to the end
+/// either way, so the copy cannot complete without the cleanup that follows it.
+async fn restore(app: &Shared, source: &str) -> Result<(), anyhow::Error> {
+    let (app, source) = (app.clone(), source.to_owned());
     tokio::task::spawn_blocking(move || {
-        app.db.check_backup(&source)?;
-        app.db.restore_from(&source)?;
+        let outcome = app.db.check_backup(&source).and_then(|()| app.db.restore_from(&source));
+        // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
+        // and a plain copy of a running hub's database is exactly that. They are
+        // removed when the connection closes cleanly; these three lines cover the
+        // case where it does not.
+        for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
+            let _ = std::fs::remove_file(leftover);
+        }
+        outcome?;
+        // The handler that would report it may be gone, and the panel then shows
+        // a failure; this line is the record that the database was replaced.
+        info!("database restored from an uploaded backup");
         // A statement about where this hub is reachable from, which the file
         // cannot carry to a different machine; the operator confirms it again.
-        app.db.set("origin_cdn_only", "off")
+        app.db.set("origin_cdn_only", "off")?;
+        // Agents authenticate at the handshake, and the tokens they hold may now
+        // belong to different nodes, or to none. Dropping the senders ends those
+        // loops; each reconnects against the restored database.
+        app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+        // Held readings belong to the database just replaced.
+        app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        invalidate_snapshot(&app);
+        app.db.drop_all_sessions()
     })
     .await?
 }
@@ -1810,15 +1828,16 @@ pub async fn upload_theme(
         return fail(e);
     }
 
-    // Off the runtime: gunzip plus a few thousand small writes.
-    let installed = {
-        let (app, path) = (app.clone(), source.clone());
-        tokio::task::spawn_blocking(move || {
-            crate::frontend::install(&app.themes, std::fs::File::open(&path)?, None)
-        })
-        .await
-    };
-    let _ = std::fs::remove_file(&source);
+    // Off the runtime: gunzip plus a few thousand small writes. The archive is
+    // removed on the same thread, which outlives a client that disconnects.
+    let installed = tokio::task::spawn_blocking(move || {
+        let installed = std::fs::File::open(&source)
+            .map_err(anyhow::Error::from)
+            .and_then(|file| crate::frontend::install(&app.themes, file, None));
+        let _ = std::fs::remove_file(&source);
+        installed
+    })
+    .await;
     match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
         Err(e) => fail(e),
@@ -1846,7 +1865,7 @@ const RELEASES_RETRY: i64 = 600;
 /// is fetched until an administrator opens the panel, so a hub whose panel is
 /// never opened makes no outbound request.
 pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
-    let cached = app.releases.lock().unwrap().clone();
+    let cached = app.releases.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
         cached
     } else {
@@ -1859,7 +1878,7 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
             hub: hub.unwrap_or_default(),
             agent: agent.unwrap_or_default(),
         };
-        *app.releases.lock().unwrap() = read.clone();
+        *app.releases.lock().unwrap_or_else(|e| e.into_inner()) = read.clone();
         read
     };
     Json(json!({
@@ -2348,7 +2367,7 @@ pub async fn save_settings(
         }
         let saved = match key.as_str() {
             "github_allowed_users" => app.db.set_github_allowed(value),
-            _ => app.db.set(key, value),
+            _ => app.db.set(key, crate::notify::stored(key, value)),
         };
         if let Err(e) = saved {
             return fail(e);
@@ -2548,7 +2567,29 @@ mod tests {
         assert_eq!(stored.name, "探测", "and it labels an anonymous chart");
         // Trimming must not turn a blank entry into a saved row.
         assert_eq!(save("   ", "   ").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(save("   ", "1.1.1.1:443").await.status(), StatusCode::BAD_REQUEST, "a name is required");
         assert_eq!(app.db.ping_tasks().unwrap().len(), 1);
+    }
+
+    /// A target reaches the agent inside a frame it refuses past 64 KiB, so it
+    /// has a ceiling; a name of exactly `MAX_NAME` characters is still taken.
+    #[tokio::test]
+    async fn a_probe_name_and_target_have_a_ceiling() {
+        let app = std::sync::Arc::new(app());
+        let save = |name: String, target: String| {
+            let task = PingTask { id: 0, name, target, interval: 60, nodes: vec![], ..Default::default() };
+            save_ping_task(Admin, State(app.clone()), Json(task))
+        };
+        let host = |len: usize| format!("{}:65535", "a".repeat(len - ":65535".len()));
+        assert_eq!(save("探".repeat(MAX_NAME), "1.1.1.1:443".into()).await.status(), StatusCode::OK);
+        assert_eq!(
+            save("p".into(), "a\u{85}b:80".into()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "control character"
+        );
+        assert_eq!(save("p".into(), host(MAX_TARGET)).await.status(), StatusCode::OK);
+        assert_eq!(save("p".into(), host(MAX_TARGET + 1)).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.ping_tasks().unwrap().len(), 2);
     }
 
     /// The same rule as `retention_days`, applied to the other value this hub
@@ -2678,68 +2719,90 @@ mod tests {
     /// This does not cover the rename in `db_restore`, which changes which path is
     /// open during the copy and would require a second upload landing inside it.
     /// It covers the part that outlives the request, which is what a later edit
-    /// could silently drop.
+    /// could silently drop: once with the answer awaited, and once with the
+    /// handler dropped right after the copy starts, as a client disconnecting or a
+    /// proxy timing out does.
     #[tokio::test]
     async fn a_finished_restore_leaves_no_scratch_file_behind() {
-        let tmp = crate::TempDir::new("restore");
-        let dir = tmp.0.clone();
-        let live = dir.join("live.db").to_string_lossy().into_owned();
-        let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
-        node(&app, "kept", true);
-        app.db.set("origin_cdn_only", "on").unwrap();
-        // In the backup, and so restored with it unless the restore drops it.
-        app.db.create_session(&sha256("backed-up"), Utc::now().timestamp() + 3_600).unwrap();
+        for dropped in [false, true] {
+            let tmp = crate::TempDir::new("restore");
+            let dir = tmp.0.clone();
+            let live = dir.join("live.db").to_string_lossy().into_owned();
+            let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
+            node(&app, "kept", true);
+            app.db.set("origin_cdn_only", "on").unwrap();
+            // In the backup, and so restored with it unless the restore drops it.
+            app.db.create_session(&sha256("backed-up"), Utc::now().timestamp() + 3_600).unwrap();
 
-        // What a restore actually receives: a backup of a hub database.
-        let copy = format!("{live}.copy");
-        app.db.backup_into(&copy).unwrap();
-        let bytes = std::fs::read(&copy).unwrap();
-        std::fs::remove_file(&copy).unwrap();
-        // Not in the backup: it stays until the last chunk has arrived.
-        node(&app, "added", true);
+            // What a restore actually receives: a backup of a hub database.
+            let copy = format!("{live}.copy");
+            app.db.backup_into(&copy).unwrap();
+            let bytes = std::fs::read(&copy).unwrap();
+            std::fs::remove_file(&copy).unwrap();
+            // Not in the backup: it stays until the last chunk has arrived.
+            node(&app, "added", true);
 
-        // In two chunks, as the panel sends any backup larger than one.
-        let (total, half) = (bytes.len() as u64, bytes.len() / 2);
-        let mut done = None;
-        for (offset, piece) in [(0, &bytes[..half]), (half as u64, &bytes[half..])] {
-            let piece = axum::body::Body::from(piece.to_vec());
-            done = Some(
+            // In two chunks, as the panel sends any backup larger than one.
+            let (total, half) = (bytes.len() as u64, bytes.len() / 2);
+            let chunk = |offset: u64, piece: &[u8]| {
                 db_restore(
                     Admin,
                     State(app.clone()),
                     Query(Chunk { offset, total }),
                     HeaderMap::new(),
-                    piece,
+                    axum::body::Body::from(piece.to_vec()),
                 )
-                .await,
+            };
+            chunk(0, &bytes[..half]).await;
+            assert_eq!(app.db.nodes().unwrap().len(), 2, "restored on the last chunk alone");
+            let last = chunk(half as u64, &bytes[half..]);
+            if dropped {
+                // Polled until the upload is moved aside, which is where the copy
+                // is handed to its thread, and dropped before it can answer.
+                let upload = format!("{live}.upload");
+                let mut last = Box::pin(last);
+                while std::path::Path::new(&upload).exists() {
+                    let polled = tokio::time::timeout(std::time::Duration::ZERO, &mut last).await;
+                    assert!(polled.is_err(), "answered before it could be dropped");
+                    tokio::task::yield_now().await;
+                }
+                drop(last);
+                for _ in 0..500 {
+                    if !app.db.session_valid(&sha256("backed-up")) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } else {
+                assert_eq!(last.await.status(), StatusCode::OK);
+            }
+            assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
+            assert!(
+                !app.db.session_valid(&sha256("backed-up")),
+                "a session from the backup does not come back"
             );
-            let expected = if offset == 0 { 2 } else { 1 };
-            assert_eq!(app.db.nodes().unwrap().len(), expected, "restored on the last chunk alone");
-        }
-        assert_eq!(done.unwrap().status(), StatusCode::OK);
-        assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
-        assert!(!app.db.session_valid(&sha256("backed-up")), "a session from the backup does not come back");
-        assert_eq!(
-            app.db.get("origin_cdn_only").as_deref(),
-            Some("off"),
-            "the premise is the operator's to restate"
-        );
+            assert_eq!(
+                app.db.get("origin_cdn_only").as_deref(),
+                Some("off"),
+                "the premise is the operator's to restate"
+            );
 
-        // The database and its journal are the only files that may remain.
-        let left: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-            .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
-            .collect();
-        assert!(left.is_empty(), "left beside the database: {left:?}");
+            // The database and its journal are the only files that may remain.
+            let left: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
+                .collect();
+            assert!(left.is_empty(), "left beside the database (dropped: {dropped}): {left:?}");
+        }
     }
 
     /// A connected agent holding one report. The receiver is returned because
     /// dropping it closes the channel, which is the signal `reset_token` is tested
     /// for.
-    fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<String> {
+    fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut agent = crate::agent_ws::Agent::new(7, tx);
+        let mut agent = crate::agent_ws::Agent::new(7, tokio::sync::mpsc::channel(16).0, tx);
         agent.metrics = metrics;
         agent.last_seen = Utc::now().timestamp();
         app.agents.write().unwrap().insert(id, agent);
@@ -2996,8 +3059,8 @@ mod tests {
     #[test]
     fn the_public_view_hides_private_nodes_and_sensitive_fields() {
         let app = app();
-        let open = node(&app, "open", true);
         node(&app, "hidden", false);
+        let open = node(&app, "open", true);
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "").unwrap();
 
         // A live report, so the public view has metrics to strip. `hostname` is
@@ -3262,23 +3325,46 @@ mod tests {
     }
 
     /// What the panel saves is what an anonymous visitor reads, under the same
-    /// condition as the node list, and only an installed theme takes a write.
+    /// condition as the node list. Each theme keeps its own settings, and only
+    /// an installed theme takes a write.
     #[tokio::test]
     async fn saved_theme_settings_reach_visitors_while_the_status_page_is_open() {
-        let app = std::sync::Arc::new(app());
+        let themes = crate::TempDir::new("theme-config");
+        let aurora = themes.0.join("aurora");
+        std::fs::create_dir_all(aurora.join("dist")).unwrap();
+        std::fs::write(aurora.join("dist/index.html"), "").unwrap();
+        std::fs::write(
+            aurora.join("theme.json"),
+            r#"{"name":"极光","short":"aurora","description":"","version":"1","author":"a","url":""}"#,
+        )
+        .unwrap();
+        let app = std::sync::Arc::new(App { themes: themes.0.clone(), ..app() });
         let state = || axum::extract::State(app.clone());
         let read = |short: &str| theme_config(state(), HeaderMap::new(), Path(short.to_owned()));
         let body = |r: Response| async { axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap() };
+        let save = |short: &str, values: &Value| {
+            save_theme_config(
+                Admin,
+                state(),
+                Path(short.to_owned()),
+                Json(values.as_object().unwrap().clone()),
+            )
+        };
+        let stored = |short: &'static str| async move {
+            serde_json::from_slice::<Value>(&body(read(short).await).await).unwrap()
+        };
 
-        assert_eq!(&body(read("default").await).await[..], b"{}", "nothing saved reads as no overrides");
-        let values = json!({"notice": "维护中", "show_price": false}).as_object().unwrap().clone();
-        let saved = save_theme_config(Admin, state(), Path("default".into()), Json(values.clone())).await;
-        assert_eq!(saved.status(), StatusCode::NO_CONTENT);
-        let read_back: Value = serde_json::from_slice(&body(read("default").await).await).unwrap();
-        assert_eq!(read_back, Value::Object(values.clone()));
+        assert_eq!(stored("default").await, json!({}), "nothing saved reads as no overrides");
+        let values = json!({"notice": "维护中", "show_price": false});
+        let other = json!({"notice": "极光"});
+        assert_eq!(save("default", &values).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(save("aurora", &other).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(stored("default").await, values, "each theme keeps its own settings");
+        assert_eq!(stored("aurora").await, other);
 
-        let missing = save_theme_config(Admin, state(), Path("aurora".into()), Json(values.clone())).await;
+        let missing = save("solar", &values).await;
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "a theme that is not installed takes no write");
+        assert_eq!(stored("solar").await, json!({}), "and nothing is stored for it");
         assert_eq!(read("../etc").await.status(), StatusCode::NOT_FOUND);
 
         app.db.set("public_page", "off").unwrap();
@@ -3445,6 +3531,21 @@ mod tests {
             assert_eq!(updated.status(), StatusCode::BAD_REQUEST, "update accepted {bad}");
         }
         assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
+        let longest = json!({"name": "名".repeat(MAX_NAME)});
+        let created = create_node(
+            Admin,
+            axum::extract::State(app.clone()),
+            panel_headers(),
+            Ok(Json(serde_json::from_value(longest.clone()).unwrap())),
+        );
+        assert_eq!(created.await.status(), StatusCode::OK, "the longest name is accepted on create");
+        let updated = update_node(
+            Admin,
+            axum::extract::State(app.clone()),
+            Path(id),
+            Ok(Json(serde_json::from_value(longest).unwrap())),
+        );
+        assert_eq!(updated.await.status(), StatusCode::OK, "and on update");
     }
 
     /// A length with a name is stored under it, so a theme built for hub 1.3.0
@@ -3811,7 +3912,7 @@ mod tests {
         assert!((Utc::now().timestamp() - 1_700_000_000 - ago).abs() <= 1, "counted on the hub's clock");
 
         node(&app, "never", true);
-        assert_eq!(visible_nodes(&app, true).unwrap()[1]["last_seen_ago"], Value::Null, "never seen");
+        assert_eq!(visible_nodes(&app, true).unwrap()[0]["last_seen_ago"], Value::Null, "never seen");
     }
 
     /// The stored capacities trail the reports by up to a minute, and a disk is
@@ -4116,6 +4217,13 @@ mod tests {
         let Json(read) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
         assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
         assert_eq!(read["your_address"], "198.51.100.7");
+        assert_eq!(
+            read["notify_telegram_text"],
+            crate::notify::DEFAULT_TEXT,
+            "an unset template reads as its default"
+        );
+        assert_eq!(read["notify_webhook_body"], crate::notify::DEFAULT_BODY);
+        assert_eq!(read["notify_login"], "on");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -4137,6 +4245,108 @@ mod tests {
             "a fresh hub's own settings must survive a round trip"
         );
         assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
+        let Json(again) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
+        for key in ["notify_telegram_text", "notify_webhook_body", "notify_login"] {
+            assert_eq!(again[key], read[key], "{key} reads back as it was echoed");
+        }
+        // The echoed Telegram text is stored as following the default, so a
+        // release that changes it reaches this hub; the webhook body, the format
+        // a receiver parses, and an edited text are kept as sent.
+        assert_eq!(app.db.get("notify_telegram_text").unwrap_or_default(), "");
+        assert_eq!(app.db.get("notify_webhook_body").as_deref(), Some(crate::notify::DEFAULT_BODY));
+        let edited = "{{title}}";
+        let saved = save_settings(
+            Admin,
+            State(app.clone()),
+            HeaderMap::new(),
+            Json(json!({"notify_telegram_text": edited})),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(app.db.get("notify_telegram_text").as_deref(), Some(edited));
+    }
+
+    /// The sign-in alert switch, saved as the panel saves it, reads back as
+    /// stored either way.
+    #[tokio::test]
+    async fn the_sign_in_alert_switch_reads_back_as_saved() {
+        let app = std::sync::Arc::new(app());
+        for value in ["off", "on"] {
+            let saved = save_settings(
+                Admin,
+                State(app.clone()),
+                HeaderMap::new(),
+                Json(json!({"notify_login": value})),
+            )
+            .await;
+            assert_eq!(saved.status(), StatusCode::OK);
+            let Json(read) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
+            assert_eq!(read["notify_login"], value);
+        }
+    }
+
+    /// Each key's check, through the route that stores it: a refused value
+    /// answers 400 and leaves the value stored before it in place. Internal
+    /// state and unknown names are refused whatever their value.
+    #[tokio::test]
+    async fn each_setting_is_checked_before_it_is_stored() {
+        use base64::Engine;
+        let app = std::sync::Arc::new(app());
+        let save = |key: &str, value: &str| {
+            save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(json!({ key: value })))
+        };
+        let png = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n")
+        );
+        for (key, accepted, refused) in [
+            ("theme", "default", "not-installed"),
+            ("github_proxy", "https://mirror.example/", "http://mirror.example/"),
+            ("favicon", png.as_str(), "data:image/png;base64,aGVsbG8="),
+            ("touch_icon", png.as_str(), "data:text/html;base64,aGVsbG8="),
+            ("origin_cdn_only", "on", "yes"),
+        ] {
+            assert_eq!(save(key, accepted).await.status(), StatusCode::OK, "{key}={accepted}");
+            assert_eq!(save(key, refused).await.status(), StatusCode::BAD_REQUEST, "{key}={refused}");
+            assert_eq!(app.db.get(key).as_deref(), Some(accepted), "{key}");
+        }
+        assert_eq!(save("favicon", "").await.status(), StatusCode::OK, "an empty icon clears it");
+        assert_eq!(app.db.get("favicon").as_deref(), Some(""));
+
+        assert_eq!(save("admin_password", "elevenchars").await.status(), StatusCode::BAD_REQUEST);
+        assert!(app.db.get("admin_password_hash").is_none());
+        assert_eq!(save("admin_password", "twelve-chars").await.status(), StatusCode::OK);
+        assert!(app.db.get("admin_password_hash").is_some());
+
+        assert_eq!(save("github_client_secret", "s3cret").await.status(), StatusCode::OK);
+        assert_eq!(app.db.get("github_client_secret").as_deref(), Some("s3cret"));
+
+        let issued = crate::db::ID_TABLES.map(|table| format!("{table}_id_issued"));
+        let internal = [
+            "register_key",
+            "register_until",
+            "admin_password_hash",
+            "notify_expiry_sent",
+            "theme_config:default",
+            crate::auth::GITHUB_IDS,
+            crate::db::ROLLED,
+            crate::notify::TRAFFIC_ALERTED,
+            "no_such_key",
+        ];
+        for key in internal.iter().copied().chain(issued.iter().map(String::as_str)) {
+            app.db.set(key, "kept").unwrap();
+            assert_eq!(save(key, "changed").await.status(), StatusCode::BAD_REQUEST, "{key}");
+            assert_eq!(app.db.get(key).as_deref(), Some("kept"), "{key}");
+        }
+
+        // Taking a name off the list also drops the account it was bound to.
+        app.db.set(crate::auth::GITHUB_IDS, "").unwrap();
+        app.db.set_github_allowed("alice,bob").unwrap();
+        assert_eq!(app.db.bind_github("alice", "1").unwrap().as_deref(), Some("1"));
+        assert_eq!(app.db.bind_github("bob", "2").unwrap().as_deref(), Some("2"));
+        assert_eq!(save("github_allowed_users", "bob").await.status(), StatusCode::OK);
+        assert_eq!(app.db.get("github_allowed_users").as_deref(), Some("bob"));
+        assert_eq!(app.db.get(crate::auth::GITHUB_IDS).as_deref(), Some("bob:2"));
     }
 
     #[tokio::test]
@@ -4186,6 +4396,8 @@ mod tests {
             (StatusCode::UNPROCESSABLE_ENTITY, "Failed to deserialize the JSON body").into_response();
         assert_eq!(read(rejection).await, "请求格式不对");
         assert_eq!(read(StatusCode::UNAUTHORIZED.into_response()).await, "登录已失效，请重新登录");
+        assert_eq!(read(StatusCode::NOT_FOUND.into_response()).await, "请求的内容不存在");
+        assert_eq!(read(StatusCode::BAD_GATEWAY.into_response()).await, INTERNAL);
         assert_eq!(read(bad("请填写节点名称")).await, "请填写节点名称");
     }
 }

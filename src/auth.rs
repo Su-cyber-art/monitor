@@ -26,6 +26,8 @@ use crate::{App, Shown};
 
 pub const COOKIE: &str = "monitor_session";
 const STATE_COOKIE: &str = "monitor_oauth_state";
+/// Read by name in the panel's `Login.tsx`.
+const FAILURE_COOKIE: &str = "monitor_login_error";
 const SESSION_DAYS: i64 = 14;
 /// Failed password attempts allowed per address before it is shut out.
 const MAX_ATTEMPTS: u32 = 5;
@@ -292,8 +294,22 @@ fn sign_in_failed(app: &App, headers: &HeaderMap, e: anyhow::Error) -> Response 
     // the redirect.
     warn!("GitHub sign-in rejected: {e:#}");
     let reason = e.downcast_ref::<Shown>().map_or(crate::api::INTERNAL, |shown| shown.0.as_str());
-    let target = format!("/admin/nodes?login_error={}", urlencode(reason));
-    with_cookies(Redirect::to(&target), [clear_state(app, headers), String::new()])
+    let cookie = failure_cookie(reason, app.secure_cookies(headers));
+    with_cookies(Redirect::to("/admin/nodes"), [clear_state(app, headers), cookie])
+}
+
+/// Carries a failed sign-in's reason to the sign-in page, which reads it once
+/// and deletes it. A query string would let any link print text of its choosing
+/// in red on the panel's own sign-in page; a site on another domain cannot set a
+/// cookie for this one. Readable by script, scoped to the panel, and
+/// short-lived so a later visit does not show a stale reason. The panel deletes
+/// it by writing the same name and Path.
+fn failure_cookie(reason: &str, secure: bool) -> String {
+    let mut cookie = format!("{FAILURE_COOKIE}={}; SameSite=Lax; Path=/admin; Max-Age=60", urlencode(reason));
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
 }
 
 fn clear_state(app: &App, headers: &HeaderMap) -> String {
@@ -320,7 +336,7 @@ pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [Strin
 }
 
 /// Percent-encodes everything outside the unreserved set, sufficient for
-/// placing an arbitrary message in a query string.
+/// placing an arbitrary message in a cookie value or a query string.
 fn urlencode(value: &str) -> String {
     value
         .bytes()
@@ -399,33 +415,34 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         .with_context(|| format!("user response ({status}): {}", body.chars().take(200).collect::<String>()))
         .context(Shown(format!("GitHub 没有返回用户信息（HTTP {}），重新登录再试", status.as_u16())))?;
 
-    if !allowed.contains(&user.login.to_lowercase()) {
-        // The list stays in the log and out of the reason, which travels back in
-        // a query string: any GitHub account can reach that page, and a reason
-        // carrying the allow list would disclose the accounts worth phishing.
-        warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
-        refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
-    }
-    let id = user.id.to_string();
-    match app.db.bind_github(&user.login.to_lowercase(), &id)? {
-        None => {
-            warn!("GitHub user {} was removed from the allowed list during sign-in", user.login);
-            refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
-        }
-        Some(bound) if bound != id => {
-            warn!(
-                "GitHub user {} is account {id}, but the name first signed in as account {bound}",
-                user.login
-            );
-            refuse!(
-                "GitHub 用户 {} 已经不是第一次登录时的那个账号。如果账号确实重建过，先把它从允许名单里删掉并保存，再加回来",
-                user.login
-            );
-        }
-        Some(_) => {}
-    }
+    admit(app, &user.login, &user.id.to_string())?;
     info!("GitHub sign-in accepted for {}", user.login);
     Ok(user.login)
+}
+
+/// Admits a GitHub account whose login the allow list names, provided it is the
+/// account that login first signed in as. `Db::bind_github` decides both under
+/// the writer lock; this turns its answer into the reason the sign-in page shows.
+fn admit(app: &App, login: &str, account: &str) -> Result<()> {
+    match app.db.bind_github(&login.to_lowercase(), account)? {
+        None => {
+            // The list stays in the log and out of the reason, which travels back in
+            // a query string: any GitHub account can reach that page, and a reason
+            // carrying the allow list would disclose the accounts worth phishing.
+            let list = app.db.get("github_allowed_users").unwrap_or_default();
+            warn!("GitHub user {login} is not on the allowed list {list:?}");
+            refuse!("GitHub 用户 {login} 不在允许登录的名单里");
+        }
+        Some(bound) if bound != account => {
+            warn!(
+                "GitHub user {login} is account {account}, but the name first signed in as account {bound}"
+            );
+            refuse!(
+                "GitHub 用户 {login} 已经不是第一次登录时的那个账号。如果账号确实重建过，先把它从允许名单里删掉并保存，再加回来"
+            );
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// The GitHub account each listed login belonged to when it first signed in,
@@ -460,13 +477,14 @@ pub fn keep_listed(ids: &str, list: &str) -> String {
 /// caller could mint a fresh identity per request, bypassing the lockout and
 /// growing the throttle map without bound.
 ///
-/// The last value is taken, not the first. Both documented proxies append
-/// rather than replace -- nginx's `$proxy_add_x_forwarded_for`, caddy's
-/// `reverse_proxy` default -- so a caller supplying its own `X-Forwarded-For`
-/// leaves that value at the head while the address the proxy observed lands at
-/// the tail. Reading the head would return control of the lockout to the
-/// caller: rotating the header makes every attempt a fresh address, and writing
-/// the operator's address locks them out of the sign-in page.
+/// The last value is taken, not the first. Each documented proxy puts the
+/// address it observed last: nginx's `$proxy_add_x_forwarded_for` appends it to
+/// whatever the caller sent, and caddy's `reverse_proxy` replaces the header
+/// from a peer outside `trusted_proxies`. A value the caller supplies thus
+/// never reaches the tail. Reading the head would return control of the
+/// lockout to the caller: rotating the header makes every attempt a fresh
+/// address, and writing the operator's address locks them out of the sign-in
+/// page.
 ///
 /// A second trusted proxy in front of the local one places its own address at
 /// the tail instead. No single value in this header identifies the client, so
@@ -639,6 +657,27 @@ mod tests {
         assert_eq!(held(), 0);
     }
 
+    /// The binding rules are `Db::bind_github`'s and tested there. What `admit`
+    /// adds is the case GitHub ignores, and refusals whose reason, which travels
+    /// in a query string, names neither the list nor the bound account.
+    #[test]
+    fn github_admits_only_a_listed_name_and_only_the_account_it_first_bound() {
+        let app = shared();
+        app.db.set_github_allowed("Alice,bob").unwrap();
+        let refused = |login: &str, account| {
+            let e = admit(&app, login, account).expect_err(login);
+            e.downcast_ref::<Shown>().expect("a reason for the sign-in page").0.to_lowercase()
+        };
+
+        assert!(admit(&app, "ALICE", "1001").is_ok(), "a listed name signs in whatever its case");
+        assert!(admit(&app, "alice", "1001").is_ok(), "and its account returns");
+        let reason = refused("alice", "2002");
+        assert!(reason.contains("不是第一次登录时的那个账号") && !reason.contains("1001"), "{reason}");
+        let reason = refused("mallory", "3003");
+        assert!(reason.contains("mallory 不在允许登录的名单里"), "{reason}");
+        assert!(!reason.contains("alice") && !reason.contains("bob"), "{reason}");
+    }
+
     /// Taken by every test that passes through `PASSWORD_GATE`, which is
     /// process-wide: one holding every permit would refuse a parallel login.
     static GATE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -695,10 +734,14 @@ mod tests {
             let query =
                 Callback { code: Some("code".into()), state: state.map(Into::into), ..Default::default() };
             let res = github_callback(State(app.clone()), peer(), headers, Query(query)).await;
-            let to = res.headers()[header::LOCATION].to_str().unwrap();
-            assert!(to.ends_with(&urlencode("登录已过期，请从登录页重新开始")), "{state:?} {cookie:?}: {to}");
-            let sessions = res.headers().get_all(header::SET_COOKIE).iter();
-            assert!(!sessions.into_iter().any(|c| c.to_str().unwrap().starts_with(&format!("{COOKIE}="))));
+            assert_eq!(res.headers()[header::LOCATION], "/admin/nodes", "{state:?} {cookie:?}");
+            let set: Vec<_> =
+                res.headers().get_all(header::SET_COOKIE).iter().map(|c| c.to_str().unwrap()).collect();
+            assert!(!set.iter().any(|c| c.starts_with(&format!("{COOKIE}="))));
+            let reason = format!("{FAILURE_COOKIE}={}", urlencode("登录已过期，请从登录页重新开始"));
+            let failure = set.iter().find(|c| c.starts_with(&reason)).expect("the reason rides in a cookie");
+            // The sign-in page reads it from script, on the panel's path only.
+            assert!(!failure.contains("HttpOnly") && failure.contains("; Path=/admin;"), "{failure}");
         }
     }
 
@@ -717,7 +760,7 @@ mod tests {
 
     /// Both ends of the same redirect: every form GitHub can send must parse,
     /// or it never reaches the handler and can be neither logged nor explained,
-    /// and the reason sent back must survive its query string.
+    /// and the reason sent back must survive encoding.
     #[test]
     fn every_callback_shape_parses_and_a_failure_reason_survives_the_round_trip() {
         let parse = |q: &str| serde_urlencoded::from_str::<Callback>(q);
@@ -737,8 +780,8 @@ mod tests {
         assert!(parse("state=xyz").is_ok());
         assert!(parse("").is_ok());
 
-        // Anything that would escape the query string must be encoded, or the
-        // reason arrives truncated at the first stray separator.
+        // Anything that would escape a cookie value or query string must be
+        // encoded, or the reason arrives truncated at the first stray separator.
         assert_eq!(urlencode("a&b=c#d"), "a%26b%3Dc%23d");
         assert_eq!(urlencode("用户"), "%E7%94%A8%E6%88%B7");
         let reason = "no allowed GitHub users configured (a&b=c)";

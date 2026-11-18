@@ -15,13 +15,13 @@ PATH="$PATH:/usr/sbin:/sbin"
 ROOT="/opt/monitor"
 BIN="$ROOT/monitor-agent"
 AGENT_DIR="$ROOT/agent"
+UNINSTALL_HELPER="$ROOT/agent-uninstall"
+UNINSTALL_UNIT="/etc/systemd/system/monitor-agent-uninstall.service"
+UNINSTALL_PATH="/etc/systemd/system/monitor-agent-uninstall.path"
 ENV_FILE="$ROOT/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
 LOG_FILE="/var/log/monitor-agent.log"
-UNINSTALL_HELPER="$ROOT/agent-uninstall"
-UNINSTALL_UNIT="/etc/systemd/system/monitor-agent-uninstall.service"
-UNINSTALL_PATH="/etc/systemd/system/monitor-agent-uninstall.path"
 SERVER=""
 TOKEN=""
 REGISTER=""
@@ -70,12 +70,15 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
-	rm -f "$UNINSTALL_HELPER" "$UNINSTALL_UNIT" "$UNINSTALL_PATH"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" \
+		"$UNIT_FILE".install-* "$RC_FILE".install-*
+	rm -rf "$ROOT"/.install-*
+	rm -f "$UNINSTALL_HELPER" "$UNINSTALL_UNIT" "$UNINSTALL_PATH" \
+		"$UNINSTALL_UNIT".install-* "$UNINSTALL_PATH".install-*
 	rm -f "$AGENT_DIR/monitor-agent" "$AGENT_DIR/monitor-agent.previous" \
 		"$AGENT_DIR/monitor-agent.backup" "$AGENT_DIR/monitor-agent.download" \
-		"$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp"
-	rm -f "$AGENT_DIR/uninstall.json" "$AGENT_DIR/uninstall.tmp"
+		"$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp" \
+		"$AGENT_DIR/uninstall.json" "$AGENT_DIR/uninstall.tmp"
 	rmdir "$AGENT_DIR" 2>/dev/null || true
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
@@ -228,12 +231,20 @@ http://*)
 	exit 2
 	;;
 esac
-if command -v systemctl >/dev/null; then
+# systemd by the test sd_booted(3) performs, OpenRC by the runlevel it records
+# once booted: either may be installed where it is not the running init (WSL, a
+# container), and every service call below would fail there after the key is
+# spent. Decided before
+# the download and the registration for the same reason.
+if [ -d /run/systemd/system ]; then
 	INIT=systemd
-elif command -v rc-update >/dev/null; then
+elif [ -e /run/openrc/softlevel ] && command -v rc-update >/dev/null; then
 	INIT=openrc
 else
-	echo "this installer needs systemd or OpenRC" >&2
+	echo "this installer needs systemd or OpenRC running as the init system" >&2
+	if command -v systemctl >/dev/null || command -v rc-update >/dev/null; then
+		echo "one is installed but did not boot this machine, as in WSL or a container" >&2
+	fi
 	exit 1
 fi
 
@@ -265,10 +276,31 @@ esac
 # fetch releases itself is configured with a GitHub proxy in its own settings,
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
-TMP="$(mktemp)"
-STAGED_BIN="$ROOT/.monitor-agent.install.$$"
-STAGED_HELPER="$ROOT/.agent-uninstall.install.$$"
-trap 'rm -f "$TMP" "$STAGED_BIN" "$STAGED_HELPER"' EXIT
+
+# Everything this install writes is written while the running agent still
+# serves, into a directory of this run's own beside the final names, the
+# download included and the binary before the registration: a full disk then
+# ends the script before a key is spent or the agent is stopped, and what
+# follows the stop is renames, which need no space. A run that stops early
+# leaves nothing behind, and a concurrent one cannot remove what this one
+# staged.
+install -d -m 0755 "$ROOT" "$AGENT_DIR"
+chown root "$ROOT"
+# A run killed outright leaves its staging behind: a directory holding a whole
+# binary, and a service definition beside the final one. Those untouched for a
+# day belong to no live run.
+find "$ROOT" -maxdepth 1 -name '.install-*' -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
+find /etc/systemd/system /etc/init.d -maxdepth 1 -name 'monitor-agent*.install-*' -mmin +1440 \
+	-exec rm -f {} \; 2>/dev/null || true
+STAGE="" SERVICE_NEW="" UNINSTALL_UNIT_NEW="" UNINSTALL_PATH_NEW=""
+# Staged files are removed on any exit before they take their final names, and
+# $ROOT once nothing is left in it. Until the stop below a signal is turned into
+# an exit, since dash runs no EXIT trap for a signal that kills it; from the
+# stop on, signals are ignored (see there).
+trap 'rm -f ${SERVICE_NEW:+"$SERVICE_NEW"} ${UNINSTALL_UNIT_NEW:+"$UNINSTALL_UNIT_NEW"} ${UNINSTALL_PATH_NEW:+"$UNINSTALL_PATH_NEW"}; [ -z "$STAGE" ] || rm -rf "$STAGE"; rmdir "$ROOT" 2>/dev/null || true' EXIT
+trap 'exit 1' HUP INT TERM
+STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
+TMP="$STAGE/monitor-agent"
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -333,14 +365,53 @@ x86_64:62 | aarch64:183) ;;
 *) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
 esac
 
-# Only a binary that implements the fixed helper protocol can enable this
-# capability. Installing a prior release must not advertise a broken helper.
+# Kept until the new binary has proved it starts; see not_started. Never over
+# an existing copy: a run that died before that check left an unproven binary
+# in $BIN, and the copy is the one that ran before it. A hard link: $BIN is
+# replaced by a rename, which leaves this inode as it was, and a link takes no
+# space.
+if [ -f "$BIN" ] && [ ! -f "$BIN.old" ]; then
+	ln -L "$BIN" "$STAGE/old" 2>/dev/null || cp "$BIN" "$STAGE/old"
+fi
+chmod 0755 "$TMP"
+# A self-updatable agent lives in its own writable directory. The root-owned
+# entry point is a symlink; the rollback hard link above follows that symlink.
+ln -s "$AGENT_DIR/monitor-agent" "$STAGE/agent-link"
+
+# The helper is a separate root-owned copy, never a hard link to the executable
+# the service user can replace. All helper files are staged before stopping the
+# current agent, just like the main service definition below.
 REMOTE_UNINSTALL=""
-if [ "$INIT" = systemd ]; then
-	chmod 0755 "$TMP"
-	if [ "$("$TMP" --uninstall-protocol 2>/dev/null || true)" = 1 ]; then
-		REMOTE_UNINSTALL=1
-	fi
+if [ "$INIT" = systemd ] && [ "$("$TMP" --uninstall-protocol 2>/dev/null || true)" = 1 ]; then
+	REMOTE_UNINSTALL=1
+	cp "$TMP" "$STAGE/agent-uninstall"
+	UNINSTALL_UNIT_NEW=$(mktemp "$UNINSTALL_UNIT.install-XXXXXX")
+	UNINSTALL_PATH_NEW=$(mktemp "$UNINSTALL_PATH.install-XXXXXX")
+	cat >"$UNINSTALL_UNIT_NEW" <<UNIT
+[Unit]
+Description=Uninstall monitor agent on an authorized hub request
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=$ENV_FILE
+ExecStart=$UNINSTALL_HELPER --uninstall-helper
+TimeoutStartSec=240
+UMask=0077
+UNIT
+	cat >"$UNINSTALL_PATH_NEW" <<UNIT
+[Unit]
+Description=Watch for monitor agent uninstall requests
+
+[Path]
+PathExists=$AGENT_DIR/uninstall.json
+Unit=monitor-agent-uninstall.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+	chmod 0644 "$UNINSTALL_UNIT_NEW" "$UNINSTALL_PATH_NEW"
 fi
 
 # Downloaded before the registration below, because that step spends a node: the
@@ -398,62 +469,6 @@ if [ -z "$TOKEN" ]; then
 	fi
 fi
 
-# Stop an agent already running here before replacing its binary. The service
-# name is fixed, so a reinstall could never start a second copy, but without this
-# the new binary lands beneath a live process and only the restart at the end
-# picks it up. Stopping first also means the copy does not depend on `install`
-# unlinking rather than failing with ETXTBSY. Placed after the download, so a
-# node that cannot fetch the binary keeps running.
-if [ "$INIT" = openrc ]; then
-	rc-service monitor-agent stop 2>/dev/null || true
-else
-	systemctl stop monitor-agent 2>/dev/null || true
-	# An agent installed before the fixed user ran under DynamicUser=, and while
-	# it runs nss-systemd resolves its transient user of the same name: the check
-	# above passes, and useradd refuses the name as taken. Stopping the unit
-	# releases that user, so the fixed one is created here. Should that fail, the
-	# old binary and unit are still in place and are started again.
-	id -u monitor-agent >/dev/null 2>&1 || add_user || {
-		systemctl start monitor-agent 2>/dev/null || true
-		echo "cannot create the system user monitor-agent" >&2
-		exit 1
-	}
-fi
-install -d -m 0755 "$ROOT"
-chown root "$ROOT"
-if [ "$INIT" = systemd ]; then
-	systemctl disable --now monitor-agent-uninstall.path 2>/dev/null || true
-fi
-# This user can replace its own executable, but cannot write the hub, the
-# root-only env file, or a service definition. current_exe() resolves through
-# the root-owned symlink at the documented binary path into this directory.
-install -d -m 0755 "$AGENT_DIR"
-chown monitor-agent "$AGENT_DIR"
-# Kept until the new binary has proved it starts; see not_started. Never over
-# an existing copy: a run that died before that check left an unproven binary
-# in $BIN, and the copy is the one that ran before it.
-[ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
-# Set ownership under the root-owned parent, then publish without following a
-# destination symlink in the agent's writable directory.
-install -m 0755 "$TMP" "$STAGED_BIN"
-chown monitor-agent "$STAGED_BIN"
-mv -fT "$STAGED_BIN" "$AGENT_DIR/monitor-agent"
-# A manual install supersedes any interrupted self-update.
-rm -f "$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp" \
-	"$AGENT_DIR/monitor-agent.previous" "$AGENT_DIR/monitor-agent.backup" "$AGENT_DIR/monitor-agent.download"
-rm -f "$AGENT_DIR/uninstall.json" "$AGENT_DIR/uninstall.tmp"
-ln -sfn "$AGENT_DIR/monitor-agent" "$BIN"
-
-if [ -n "$REMOTE_UNINSTALL" ]; then
-	# This copy and its parent remain root-owned. Never execute the agent's
-	# self-updateable binary as root, nor give the normal service sudo access.
-	install -m 0755 "$TMP" "$STAGED_HELPER"
-	chown root "$STAGED_HELPER"
-	mv -fT "$STAGED_HELPER" "$UNINSTALL_HELPER"
-else
-	rm -f "$UNINSTALL_HELPER" "$UNINSTALL_UNIT" "$UNINSTALL_PATH"
-fi
-
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
 # keeps it private, since $ROOT itself is readable and holds the binaries. Set in
@@ -461,35 +476,22 @@ fi
 # with `systemctl cat` and need not be 0600.
 (
 	umask 077
-	cat >"$ENV_FILE" <<ENV
+	cat >"$STAGE/agent.env" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 MONITOR_ALLOW_UPGRADE=1
 ENV
-	[ -z "$REMOTE_UNINSTALL" ] || printf 'MONITOR_ALLOW_UNINSTALL=1\n' >>"$ENV_FILE"
-	[ -z "$INSECURE" ] || printf 'MONITOR_INSECURE=1\n' >>"$ENV_FILE"
-	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
+	[ -z "$REMOTE_UNINSTALL" ] || printf 'MONITOR_ALLOW_UNINSTALL=1\n' >>"$STAGE/agent.env"
+	[ -z "$INSECURE" ] || printf 'MONITOR_INSECURE=1\n' >>"$STAGE/agent.env"
+	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$STAGE/agent.env"
 )
 
-# The new agent is not running. The binary it replaced is put back and started
-# again, so a failed upgrade leaves the machine reporting as before; the unit
-# and env file just written suit that binary as well, since an upgrade keeps the
-# token and the settings. A first install has nothing to put back.
-not_started() {
-	echo "monitor-agent did not start; see: $1" >&2
-	[ -f "$BIN.old" ] || exit 1
-	mv -fT "$BIN.old" "$BIN"
-	if [ "$INIT" = openrc ]; then
-		rc-service monitor-agent restart >/dev/null 2>&1 || true
-	else
-		systemctl restart monitor-agent || true
-	fi
-	echo "the previous monitor-agent binary is back in place and was restarted" >&2
-	exit 1
-}
-
+# The service definition is staged beside its final name for the reason the
+# files above are: /etc commonly shares a disk with $ROOT.
 if [ "$INIT" = openrc ]; then
-	cat >"$RC_FILE" <<RC
+	SERVICE_FILE="$RC_FILE"
+	SERVICE_NEW=$(mktemp "$RC_FILE.install-XXXXXX")
+	cat >"$SERVICE_NEW" <<RC
 #!/sbin/openrc-run
 description="monitor agent"
 command="$BIN"
@@ -515,48 +517,10 @@ start_pre() {
 	set +a
 }
 RC
-	chmod 0755 "$RC_FILE"
-	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart
-	# supervise-daemon reports the service started while it respawns an agent
-	# that exits at once, so the process itself is what is looked for, inside
-	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
-	# against the full path.
-	sleep 3
-	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
-	rm -f "$BIN.old"
-	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
-	exit 0
-fi
-
-if [ -n "$REMOTE_UNINSTALL" ]; then
-	cat >"$UNINSTALL_UNIT" <<UNIT
-[Unit]
-Description=Uninstall monitor agent on an authorized hub request
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-EnvironmentFile=$ENV_FILE
-ExecStart=$UNINSTALL_HELPER --uninstall-helper
-TimeoutStartSec=240
-UMask=0077
-UNIT
-	cat >"$UNINSTALL_PATH" <<UNIT
-[Unit]
-Description=Watch for monitor agent uninstall requests
-
-[Path]
-PathExists=$AGENT_DIR/uninstall.json
-Unit=monitor-agent-uninstall.service
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-fi
-
-cat >"$UNIT_FILE" <<UNIT
+else
+	SERVICE_FILE="$UNIT_FILE"
+	SERVICE_NEW=$(mktemp "$UNIT_FILE.install-XXXXXX")
+	cat >"$SERVICE_NEW" <<UNIT
 [Unit]
 Description=monitor agent
 After=network-online.target
@@ -592,6 +556,115 @@ MemoryMax=64M
 [Install]
 WantedBy=multi-user.target
 UNIT
+	chmod 0644 "$SERVICE_NEW"
+fi
+
+# Stop an agent already running here before replacing its binary. The service
+# name is fixed, so a reinstall could never start a second copy, but without this
+# the new binary lands beneath a live process and only the restart at the end
+# picks it up. Placed after every write above, so a node that cannot fetch or
+# store the new files keeps running.
+#
+# From here to the health check the agent is down or unproven, and an
+# interrupted run would leave it so. Signals that would end or pause the run are
+# ignored until it ends, and a failed command no longer ends it: the health
+# check settles every step, reporting a running agent or rolling back. Output
+# can fail too, once the terminal has gone or a pipe reader has died.
+trap '' HUP INT QUIT TERM TSTP PIPE
+set +e
+if [ "$INIT" = openrc ]; then
+	rc-service monitor-agent stop 2>/dev/null || true
+else
+	systemctl disable --now monitor-agent-uninstall.path 2>/dev/null || true
+	systemctl stop monitor-agent 2>/dev/null || true
+	# An agent installed before the fixed user ran under DynamicUser=, and while
+	# it runs nss-systemd resolves its transient user of the same name: the check
+	# above passes, and useradd refuses the name as taken. Stopping the unit
+	# releases that user, so the fixed one is created here. Should that fail, the
+	# old binary and unit are still in place and are started again.
+	id -u monitor-agent >/dev/null 2>&1 || add_user || {
+		systemctl start monitor-agent 2>/dev/null || true
+		echo "cannot create the system user monitor-agent" >&2
+		exit 1
+	}
+fi
+# The new agent is not running. The binary it replaced is put back and started
+# again before anything is reported, so a failed upgrade leaves the machine
+# reporting as before; the unit and env file just written suit that binary as
+# well, since an upgrade keeps the token and the settings. A first install has
+# nothing to put back.
+not_started() {
+	if [ -f "$BIN.old" ]; then
+		# Keep the installed symlink so the restored agent can still self-update.
+		# A failure before it was published keeps the legacy direct binary layout.
+		RESTORE_TO="$BIN"
+		if [ -L "$BIN" ] && [ "$(readlink "$BIN")" = "$AGENT_DIR/monitor-agent" ]; then
+			RESTORE_TO="$AGENT_DIR/monitor-agent"
+		fi
+		# A failed rename may have left the old inode in place. Renaming its
+		# hard link onto itself does nothing, so just discard the backup link.
+		if [ "$BIN.old" -ef "$RESTORE_TO" ]; then
+			rm -f "$BIN.old"
+		else
+			mv -fT "$BIN.old" "$RESTORE_TO" || {
+				echo "could not restore the previous monitor-agent binary; see: $1" >&2
+				exit 1
+			}
+		fi
+		if [ "$INIT" = openrc ]; then
+			rc-service monitor-agent restart >/dev/null 2>&1
+		else
+			systemctl restart monitor-agent
+		fi
+		echo "monitor-agent did not start; see: $1" >&2
+		echo "the previous monitor-agent binary is back in place; check the service status" >&2
+	else
+		echo "monitor-agent did not start; see: $1" >&2
+	fi
+	exit 1
+}
+
+if ! { { [ ! -f "$STAGE/old" ] || mv -f "$STAGE/old" "$BIN.old"; } &&
+	chown monitor-agent "$AGENT_DIR" "$STAGE/monitor-agent" &&
+	mv -fT "$STAGE/monitor-agent" "$AGENT_DIR/monitor-agent" &&
+	mv -fT "$STAGE/agent-link" "$BIN" &&
+	mv -f "$STAGE/agent.env" "$ENV_FILE" &&
+	mv -f "$SERVICE_NEW" "$SERVICE_FILE"; }; then
+	echo "the new files could not be renamed into place" >&2
+	not_started "the message above"
+fi
+
+# A manual install supersedes interrupted self-update or uninstall requests.
+rm -f "$AGENT_DIR/monitor-agent.upgrade.json" "$AGENT_DIR/monitor-agent.upgrade.tmp" \
+	"$AGENT_DIR/monitor-agent.previous" "$AGENT_DIR/monitor-agent.backup" "$AGENT_DIR/monitor-agent.download" \
+	"$AGENT_DIR/uninstall.json" "$AGENT_DIR/uninstall.tmp"
+if [ -n "$REMOTE_UNINSTALL" ]; then
+	if ! { mv -fT "$STAGE/agent-uninstall" "$UNINSTALL_HELPER" &&
+		mv -f "$UNINSTALL_UNIT_NEW" "$UNINSTALL_UNIT" &&
+		mv -f "$UNINSTALL_PATH_NEW" "$UNINSTALL_PATH"; }; then
+		echo "the uninstall helper could not be renamed into place" >&2
+		not_started "the message above"
+	fi
+else
+	rm -f "$UNINSTALL_HELPER" "$UNINSTALL_UNIT" "$UNINSTALL_PATH"
+fi
+
+if [ "$INIT" = openrc ]; then
+	# Executable only under its final name, so a staged copy left by a killed
+	# run is never taken for a service.
+	chmod 0755 "$RC_FILE"
+	rc-update add monitor-agent default >/dev/null
+	rc-service monitor-agent restart
+	# supervise-daemon reports the service started while it respawns an agent
+	# that exits at once, so the process itself is what is looked for, inside
+	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
+	# against the full path.
+	sleep 3
+	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
+	rm -f "$BIN.old"
+	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
+	exit 0
+fi
 
 systemctl daemon-reload
 if [ -n "$REMOTE_UNINSTALL" ]; then
