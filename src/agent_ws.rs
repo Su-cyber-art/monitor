@@ -406,8 +406,8 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 async fn serve(app: Shared, node_id: i64, token: &str, ip: String, mut socket: WebSocket) -> Result<()> {
-    // One slot: a resend already queued reads the list as it is when it runs.
     let (tx, mut rx) = mpsc::channel::<String>(16);
+    // One slot: a resend already queued reads the list as it is when it runs.
     let (tasks, mut task_rx) = mpsc::channel::<()>(1);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather

@@ -194,14 +194,14 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
     refresh()
   }
 
-  // Confirmed first, since it replaces an order that may have taken many
-  // drags; the toast then keeps an undo long enough to think it over.
   function requestSort() {
     const ids = drag.order.map((n) => n.id).join()
     if (byName(drag.order).map((n) => n.id).join() === ids) toast("已经是按名称排的顺序")
     else setSorting(true)
   }
 
+  // Confirmed first, since it replaces an order that may have taken many
+  // drags; the toast then keeps an undo long enough to think it over.
   async function sortByName() {
     setSorting(false)
     const rows = head.current!.closest("table")!.tBodies[0]
@@ -212,7 +212,6 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
     const undo = () => drag.arrange(keepOrder(before, latest.current).map((n) => n.id), rows)
     toast.success("已按名称排序", { duration: 15_000, action: { label: "撤销", onClick: undo } })
   }
-
 
   return (
     <div className="space-y-4">

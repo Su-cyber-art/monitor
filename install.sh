@@ -597,10 +597,19 @@ not_started() {
 	if [ -f "$BIN.old" ]; then
 		# Keep the installed symlink so the restored agent can still self-update.
 		# A failure before it was published keeps the legacy direct binary layout.
+		RESTORE_TO="$BIN"
 		if [ -L "$BIN" ] && [ "$(readlink "$BIN")" = "$AGENT_DIR/monitor-agent" ]; then
-			mv -fT "$BIN.old" "$AGENT_DIR/monitor-agent"
+			RESTORE_TO="$AGENT_DIR/monitor-agent"
+		fi
+		# A failed rename may have left the old inode in place. Renaming its
+		# hard link onto itself does nothing, so just discard the backup link.
+		if [ "$BIN.old" -ef "$RESTORE_TO" ]; then
+			rm -f "$BIN.old"
 		else
-			mv -fT "$BIN.old" "$BIN"
+			mv -fT "$BIN.old" "$RESTORE_TO" || {
+				echo "could not restore the previous monitor-agent binary; see: $1" >&2
+				exit 1
+			}
 		fi
 		if [ "$INIT" = openrc ]; then
 			rc-service monitor-agent restart >/dev/null 2>&1
@@ -608,7 +617,7 @@ not_started() {
 			systemctl restart monitor-agent
 		fi
 		echo "monitor-agent did not start; see: $1" >&2
-		echo "the previous monitor-agent binary is back in place and was restarted" >&2
+		echo "the previous monitor-agent binary is back in place; check the service status" >&2
 	else
 		echo "monitor-agent did not start; see: $1" >&2
 	fi
