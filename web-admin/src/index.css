@@ -33,14 +33,11 @@
   --destructive: #dc2626;
   --border: #e4e4e7;
   --input: #dcdce2;
+  --switch-off: #787880;
   --ring: #a78bfa;
   --chart-1: #8b5cf6;
-  --chart-2: #10b981;
   --chart-3: #3b82f6;
-  --chart-4: #e97b35;
-  --chart-5: #ec4899;
   --ok: #24875a;
-  --warn: #b76a16;
   --near: #a95b17;
   --over: #dc2626;
 }
@@ -64,14 +61,11 @@
   --destructive: #fb7185;
   --border: #2d2d32;
   --input: #38383e;
+  --switch-off: color-mix(in oklab, var(--input) 80%, transparent);
   --ring: #a78bfa;
   --chart-1: #a78bfa;
-  --chart-2: #34d399;
   --chart-3: #60a5fa;
-  --chart-4: #fb923c;
-  --chart-5: #f472b6;
   --ok: #4ade80;
-  --warn: #fbbf24;
   --near: #fb923c;
   --over: #fb7185;
 }
@@ -100,13 +94,6 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  --color-chart-1: var(--chart-1);
-  --color-chart-2: var(--chart-2);
-  --color-chart-3: var(--chart-3);
-  --color-chart-4: var(--chart-4);
-  --color-chart-5: var(--chart-5);
-  --color-ok: var(--ok);
-  --color-warn: var(--warn);
   --color-near: var(--near);
   --color-over: var(--over);
 }
@@ -131,11 +118,45 @@
      this a clickable row loses its pointer exactly where the control sits. The
      component's own `disabled:cursor-not-allowed` is more specific and wins. */
   [data-slot="switch"], input[type="checkbox"] { cursor: pointer; }
+  /* The dialog places its close button in the corner of the content box without
+     reserving room for it, so a title long enough to reach that corner runs
+     under the button. components/ui/dialog.tsx puts a 1rem icon at `top-4
+     right-4` inside `p-6`, so it reaches 0.5rem into the content, and its focus
+     ring 4px further; the title alone is inset by 1rem, on both sides below
+     `sm` where it is centred. The description below sits clear of the button.
+     A title or description with no break opportunity, such as a node named like
+     a host (`hk01.vps.example.com`), wraps anywhere rather than widening the
+     dialog into a sideways scroll; node names in titles also go through
+     `nameText`, which prefers the dots. */
+  [data-slot="dialog-content"]:has(> [data-slot="dialog-close"]) [data-slot="dialog-title"] {
+    padding-inline: 1rem;
+    @variant sm { padding-left: 0; }
+  }
+  [data-slot="dialog-title"], [data-slot="dialog-description"] { overflow-wrap: anywhere; }
 }
 
 /* A drag keeps the grabbing cursor wherever the pointer goes. Unlayered, so it
    outranks the utilities. */
 :root[data-dragging] * { cursor: grabbing; }
 
+/* An unchecked switch on its own track. In light mode the component's
+   `bg-input` leaves nothing that reads at 3:1, the threshold for a control:
+   the white thumb sits on a white card and on a track 1.23:1 from both. This
+   track is 3.65:1 against white, 3.33:1 against `bg-muted`, the darkest
+   surface a switch sits on, and 4.88:1 from a checked track. In dark mode the
+   light thumb itself stands out, 17:1 from the card and 12:1 from the track,
+   so the component's own `bg-input/80` is kept, derived from `--input` as the
+   component derives it. Unlayered, so it outranks the utilities. */
+[data-slot="switch"][data-state="unchecked"] { background-color: var(--switch-off); }
+
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
+
+/* Billing dialog: the "+1" that rises from the expiry date on each renewal. */
+@keyframes renewed {
+  0% { opacity: 0; transform: translateY(6px) scale(0.7); }
+  20% { opacity: 1; transform: translateY(0) scale(1.15); }
+  35% { opacity: 1; transform: translateY(-2px) scale(1); }
+  70% { opacity: 1; transform: translateY(-8px); }
+  100% { opacity: 0; transform: translateY(-18px); }
+}

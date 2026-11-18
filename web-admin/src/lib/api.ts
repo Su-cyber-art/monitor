@@ -51,6 +51,8 @@ export type Node = {
   currency: string
   billing_cycle: string
   expires_at: string | null
+  /** Days left on the hub's calendar; negative once past. */
+  expires_in: number | null
   traffic_limit: number
   traffic_mode: string
   traffic_reset_day: number
@@ -113,6 +115,46 @@ export function visibleUpgradeResults(previous: AgentUpgrade[], incoming: AgentU
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
   return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]
+}
+
+/**
+ * By group name, the ungrouped last, then by name within each group; numbers
+ * by value ("HK-2" before "HK-10"), names starting in Chinese after the rest
+ * and by pinyin, whatever the browser's language (the zh-CN collation alone
+ * would put them before Latin); the same name by id. The result does not
+ * depend on the order it starts from, so sorting twice gives the same list.
+ */
+export function byName<T extends Pick<Node, "id" | "name" | "group">>(nodes: T[]): T[] {
+  const collator = new Intl.Collator("zh-CN", { numeric: true })
+  const han = (s: string) => Number(/^\p{Script=Han}/u.test(s))
+  // Spelled apart last: numeric collation calls "G01" and "G1" equal, and two
+  // groups must not mix.
+  const compare = (a = "", b = "") => han(a) - han(b) || collator.compare(a, b) || Number(a > b) - Number(a < b)
+  return [...nodes].sort((a, b) =>
+    Number(!a.group) - Number(!b.group) || compare(a.group, b.group) || compare(a.name, b.name) || a.id - b.id)
+}
+
+/**
+ * The items in the order of `ids`, those no longer listed skipped. One the hub
+ * has listed since keeps the place the hub gave it: first when the hub lists it
+ * ahead of every ordered item, last when after every one, and otherwise right
+ * after the ordered item it follows there. A new node then lands first, a new
+ * probe last, and a node created in a group behind that group's last member, as
+ * the hub places each, rather than wherever the next saved order would carry it.
+ */
+export function keepOrder<T extends { id: number }>(ids: number[], items: T[]): T[] {
+  const byId = new Map(items.map((item) => [item.id, item]))
+  const order = ids.flatMap((id) => byId.get(id) ?? [])
+  const ordered = new Set(ids)
+  const first = items.findIndex((item) => ordered.has(item.id))
+  const last = items.findLastIndex((item) => ordered.has(item.id))
+  if (first < 0) return items
+  let previous = items[first]
+  for (const item of items.slice(first + 1, last)) {
+    if (!ordered.has(item.id)) order.splice(order.indexOf(previous) + 1, 0, item)
+    previous = item
+  }
+  return [...items.slice(0, first), ...order, ...items.slice(last + 1)]
 }
 
 /** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */
@@ -467,7 +509,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
  * weighs. The hub accepts up to 8 MiB per request, so this can change without
  * touching the server or negotiating first.
  */
-const CHUNK = 4 * 1024 * 1024
+export const CHUNK = 4 * 1024 * 1024
 
 /**
  * Uploads a file one chunk at a time. There is no upload id: the hub tracks an
@@ -491,7 +533,10 @@ export async function upload<T>(
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
-      signal,
+      // Not the last: once it lands the hub applies the file whether or not
+      // anyone still waits for the answer, so aborting it would report a
+      // change that was made as one that was not.
+      signal: offset + CHUNK < file.size ? signal : undefined,
     })
     // A 413 never reached the hub: the proxy in front answered, and only its
     // own logs record it. The message names the setting responsible.

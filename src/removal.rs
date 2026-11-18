@@ -182,7 +182,7 @@ mod tests {
             .create_node(&Node { name: "test node".into(), ..Default::default() }, "node-token")
             .unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut agent = Agent::new(1, tx);
+        let mut agent = Agent::new(1, tx, tokio::sync::mpsc::channel(1).0);
         agent.can_uninstall = capable;
         agent.can_upgrade = true;
         app.agents.write().unwrap().insert(node, agent);

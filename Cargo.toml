@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["ws", "macros"] }
-rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 argon2 = "0.5"
 rand = "0.9"
@@ -49,6 +49,16 @@ serde_urlencoded = "0.7"
 # Tests move the relay clock and launch real agents for upgrade verification.
 # dev-dependencies do not reach the shipped binary.
 tokio = { version = "1", features = ["test-util", "process"] }
+
+# On top of clippy's defaults, which CI runs with -D warnings. Tests may still
+# unwrap (clippy.toml).
+[lints.clippy]
+# The release build aborts on panic, so a failed unwrap takes the whole hub
+# down, and every node's reporting with it: use ?, or expect("why this cannot
+# fail").
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
 
 [profile.release]
 codegen-units = 1

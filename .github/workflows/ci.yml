@@ -50,6 +50,7 @@ jobs:
       # level are all SC2015 on `[ a ] && [ b ] || die`, which is meant to die
       # when either test fails.
       - run: shellcheck -S warning install.sh install-macos.sh install-hub.sh scripts/*.sh
+      - run: python3 scripts/test-install.py
 
       # This commit's hub against the latest released agent: the field contract
       # between the two repositories, and what the public view withholds.
@@ -58,6 +59,10 @@ jobs:
           curl -fsSL -o agent https://github.com/Su-cyber-art/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
           chmod +x agent
       - run: scripts/e2e.sh target/debug/monitor-hub ./agent
+      - run: |
+          curl -fsSL -o agent-old https://github.com/Su-cyber-art/agent/releases/download/v1.4.0/monitor-agent-x86_64-unknown-linux-musl
+          chmod +x agent-old
+          scripts/e2e-upgrade.sh "$PWD/agent-old" "$PWD/agent"
 
   windows-installer:
     runs-on: windows-latest

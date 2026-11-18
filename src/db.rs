@@ -880,7 +880,7 @@ const LATE: i64 = 3_600 + 60;
 
 /// Setting holding the start of the first hour not yet folded into the hourly
 /// tier. Internal: the settings routes neither return nor accept it.
-const ROLLED: &str = "history_rolled";
+pub(crate) const ROLLED: &str = "history_rolled";
 
 /// One chart window as the database answers it.
 #[derive(Clone, Copy, Debug)]
@@ -935,17 +935,32 @@ fn rolled(conn: &Connection) -> Result<Option<i64>> {
     Ok(value.and_then(|v| v.parse().ok()))
 }
 
-/// The earliest `ts` across `tables`, sought node by node: every key here
-/// begins with `node_id`, and `MIN(ts)` over a whole table scans it, 15.9 s at
-/// 90 days of 100 nodes against 1.8 ms this way. `tables` are names from
-/// [`TABLES`].
+/// The earliest `ts` across `tables`; see [`edge`].
 fn oldest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
+    edge(conn, tables, false, i64::MIN)
+}
+
+/// The latest `ts` across `tables`; see [`edge`].
+fn newest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
+    edge(conn, tables, true, i64::MIN)
+}
+
+/// The earliest, or with `latest` the latest, `ts` at or after `from` across
+/// `tables`, sought node by node: every key here begins with `node_id`, and
+/// `MIN(ts)` over a whole table scans it, 15.9 s at 90 days of 100 nodes
+/// against 1.8 ms this way. `tables` are names from [`TABLES`].
+fn edge(conn: &Connection, tables: &[&str], latest: bool, from: i64) -> Result<Option<i64>> {
+    let aggregate = if latest { "MAX" } else { "MIN" };
     let per_node: Vec<String> = tables
         .iter()
-        .map(|t| format!("SELECT (SELECT MIN(ts) FROM {t} WHERE node_id=n.id) AS ts FROM node n"))
+        .map(|t| {
+            format!(
+                "SELECT (SELECT {aggregate}(ts) FROM {t} WHERE node_id=n.id AND ts>=?1) AS ts FROM node n"
+            )
+        })
         .collect();
-    let sql = format!("SELECT MIN(ts) FROM ({})", per_node.join(" UNION ALL "));
-    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+    let sql = format!("SELECT {aggregate}(ts) FROM ({})", per_node.join(" UNION ALL "));
+    Ok(conn.query_row(&sql, [from], |r| r.get(0))?)
 }
 
 /// Probe results as the latency fold receives them. A stored result is a
@@ -1191,12 +1206,13 @@ impl Db {
         let tx = conn.transaction()?;
         let id = next_id(&tx, "node")?;
         tx.execute(
-            // A new node belongs at the end. The caller sends sort 0, which would
-            // tie with whatever the last reorder placed first.
+            // A new node goes first, where the one who just added it looks. The
+            // caller sends sort 0, which would tie with whatever the last reorder
+            // placed first.
             "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
-             VALUES (?14,?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?14,?1,?2,(SELECT COALESCE(MIN(sort),1)-1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -1210,10 +1226,16 @@ impl Db {
                 n.traffic_mode,
                 n.traffic_reset_day,
                 Utc::now().timestamp(),
-                n.group,
+                "",
                 id
             ],
         )?;
+        // Created in a group, it joins that group's rows as a node moved into it
+        // later would, rather than drag the group's tab to the front.
+        if !n.group.is_empty() {
+            Self::gather_into_group(&tx, &[id], &n.group)?;
+            tx.execute("UPDATE node SET group_name=?1 WHERE id=?2", params![n.group, id])?;
+        }
         // Only a registration without `--name` arrives unnamed; the panel
         // requires a name.
         if n.name.is_empty() {
@@ -1261,6 +1283,9 @@ impl Db {
     pub fn update_nodes(&self, ids: &[i64], n: &NodePatch) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(group) = n.group.as_deref().filter(|g| !g.is_empty()) {
+            Self::gather_into_group(&tx, ids, group)?;
+        }
         {
             let mut update = tx.prepare(
                 "UPDATE node SET name=COALESCE(?2,name), public=COALESCE(?3,public),
@@ -1306,6 +1331,33 @@ impl Db {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Moves nodes about to enter `group` behind its last member, or to the end of
+    /// the list when it has none. Themes order groups by first appearance, so a
+    /// node entering from elsewhere in the list would otherwise drag its group's
+    /// tab along. A whole group taking a new name stays where it is.
+    fn gather_into_group(tx: &rusqlite::Transaction, ids: &[i64], group: &str) -> Result<()> {
+        let list = tx
+            .prepare("SELECT id, group_name FROM node ORDER BY sort, id")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let (entering, mut rest): (Vec<_>, Vec<_>) =
+            list.into_iter().partition(|(id, from)| ids.contains(id) && from != group);
+        let Some((_, first)) = entering.first() else { return Ok(()) };
+        let renamed = !first.is_empty()
+            && entering.iter().all(|(_, from)| from == first)
+            && !rest.iter().any(|(_, g)| g == first || g == group);
+        if renamed {
+            return Ok(());
+        }
+        let at = rest.iter().rposition(|(_, g)| g == group).map_or(rest.len(), |last| last + 1);
+        rest.splice(at..at, entering);
+        let mut update = tx.prepare("UPDATE node SET sort=?2 WHERE id=?1")?;
+        for (sort, (id, _)) in rest.iter().enumerate() {
+            update.execute(params![id, sort as i64])?;
+        }
+        Ok(())
     }
 
     pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
@@ -1516,6 +1568,12 @@ impl Db {
             ))
         });
         rows.map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+
+    /// Runs a statement on the writer, for tests that need the database to fail.
+    #[cfg(test)]
+    pub fn execute_for_test(&self, sql: &str) {
+        self.conn().execute_batch(sql).unwrap();
     }
 
     /// The traffic row as stored, without the period gate `all_traffic` applies,
@@ -1876,24 +1934,35 @@ impl Db {
     /// writes through between hours. At 100 nodes and four probes an hour takes
     /// about 15 ms.
     ///
+    /// An hour is complete once `now` is `LATE` past its end and a row stamped
+    /// after it is stored. The rows bound a clock running fast, as when the hub
+    /// starts before NTP corrects an RTC kept in local time: on that clock alone
+    /// the watermark would pass hours whose rows had not yet arrived, which then
+    /// stay out of the tier. A fleet with nothing reporting folds nothing, and
+    /// its last rows wait as minute rows until reports resume.
+    ///
     /// Without a watermark it records one at the hour of the oldest minute row,
-    /// or with none at all at the current hour, so that `prune` has a watermark
-    /// to respect. Hours before `keep_days` are skipped rather than folded, as
-    /// `prune` would drop them next.
+    /// so that `prune` has a watermark to respect; with no rows there is none
+    /// to record, and `prune` keeps every minute row. Hours before `keep_days`
+    /// are skipped rather than folded, as `prune` would drop them next.
     pub fn roll_up(&self, now: i64, keep_days: i64) -> Result<usize> {
-        {
+        let newest = {
             let conn = self.conn();
             if rolled(&conn)?.is_none() {
-                let from = oldest(&conn, &["metric", "ping_record"])?.unwrap_or(now);
-                conn.execute(
-                    "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
-                    params![ROLLED, (from.div_euclid(3_600) * 3_600).to_string()],
-                )?;
+                if let Some(from) = oldest(&conn, &["metric", "ping_record"])? {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
+                        params![ROLLED, (from.div_euclid(3_600) * 3_600).to_string()],
+                    )?;
+                }
             }
-        }
+            newest(&conn, &["metric", "ping_record"])?
+        };
+        let Some(newest) = newest else { return Ok(0) };
         let floor = (now - keep_days * 86_400).div_euclid(3_600) * 3_600;
+        let last = (now - 3_600 - LATE).min(newest - 3_600);
         let mut folded = 0;
-        while !halted() && self.fold_next(floor, now - 3_600 - LATE)? {
+        while !halted() && self.fold_next(floor, last)? {
             let_waiters_in();
             folded += 1;
         }
@@ -1926,8 +1995,9 @@ impl Db {
         let Some(hour) = rolled(&tx)?.map(|h| h.max(floor)).filter(|&h| h <= last) else {
             return Ok(false);
         };
-        tx.prepare_cached(
-            "INSERT OR REPLACE INTO metric_hour
+        let mut wrote = tx
+            .prepare_cached(
+                "INSERT OR REPLACE INTO metric_hour
                (node_id, ts, minutes, cpu, cpu_max, mem_used, swap_used, disk_used, net_rx, net_tx,
                 net_rx_max, net_tx_max, tcp, udp, procs)
              SELECT node_id, ?1, COUNT(*), AVG(cpu), MAX(MAX(cpu, cpu_max)), CAST(AVG(mem_used) AS INTEGER),
@@ -1938,8 +2008,8 @@ impl Db {
                     CAST(ROUND(AVG(procs)) AS INTEGER)
              FROM metric WHERE node_id IN (SELECT id FROM node) AND ts>=?1 AND ts<?1+3600
              GROUP BY node_id",
-        )?
-        .execute([hour])?;
+            )?
+            .execute([hour])?;
         let nodes: Vec<i64> = tx
             .prepare_cached("SELECT id FROM node")?
             .query_map([], |r| r.get(0))?
@@ -1960,12 +2030,22 @@ impl Db {
             )?;
             for (task, mut t) in probes {
                 let median = t.median();
-                write.execute(params![node, task, hour, t.answered(), t.lost, median, t.lo, t.hi])?;
+                wrote +=
+                    write.execute(params![node, task, hour, t.answered(), t.lost, median, t.lo, t.hi])?;
             }
         }
+        // An empty hour moves the watermark to the next hour holding a row, so a
+        // fleet silent for months, or a hub stopped as long, resumes in one
+        // step rather than a transaction per hour it missed.
+        let next = if wrote == 0 {
+            edge(&tx, &["metric", "ping_record"], false, hour + 3_600)?
+                .map_or(hour + 3_600, |ts| (ts.div_euclid(3_600) * 3_600).max(hour + 3_600))
+        } else {
+            hour + 3_600
+        };
         tx.execute(
             "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
-            params![ROLLED, (hour + 3_600).to_string()],
+            params![ROLLED, next.to_string()],
         )?;
         tx.commit()?;
         Ok(true)
@@ -2087,6 +2167,10 @@ impl Db {
     /// results an honest node can send.
     pub const MIN_PROBE_INTERVAL: i64 = 5;
 
+    /// A ticked node deleted before the save reached the hub. The panel's list
+    /// drops it within one push, so saving again succeeds.
+    const DELETED_TICKED: &str = "勾选的节点里有已被删除的，等列表刷新后再保存";
+
     /// Replaces the assignments wholesale, or with `base` applies only what
     /// changed from it. Either way in one transaction: failing between the
     /// deletes and the inserts would unassign nodes from a probe the panel still
@@ -2107,7 +2191,7 @@ impl Db {
             }
             t.id
         } else {
-            // At the end, as in `create_node`.
+            // At the end.
             let id = next_id(&tx, "ping_task")?;
             tx.execute(
                 "INSERT INTO ping_task (id, name, target, interval, auto_join, sort)
@@ -2131,15 +2215,17 @@ impl Db {
         for node in &added {
             // OR IGNORE covers a node that joined while the editor was open and
             // was then ticked. It does not cover the foreign key, which remains
-            // the check; naming the node turns SQLite's "FOREIGN KEY constraint
-            // failed" into something the panel can show.
+            // the check, turned from SQLite's "FOREIGN KEY constraint failed"
+            // into something the panel can show. Not by id, which the panel never
+            // shows, nor by name, which went with the row; the panel drops a
+            // deleted node from what it sends once its list catches up.
             tx.execute(
                 "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
                 params![id, node],
             )
             .map_err(|e| match e.sqlite_error_code() {
                 Some(rusqlite::ErrorCode::ConstraintViolation) => {
-                    anyhow::Error::from(e).context(crate::Shown(format!("节点 {node} 不存在，可能已被删除")))
+                    anyhow::Error::from(e).context(crate::Shown(Self::DELETED_TICKED.to_owned()))
                 }
                 _ => e.into(),
             })?;
@@ -3047,7 +3133,7 @@ fn issued(conn: &Connection, table: &str) -> Result<i64> {
 }
 
 /// The tables whose ids [`next_id`] issues.
-const ID_TABLES: [&str; 2] = ["node", "ping_task"];
+pub(crate) const ID_TABLES: [&str; 2] = ["node", "ping_task"];
 
 fn setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?)
@@ -3113,11 +3199,10 @@ pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
     let clamped = |y: i32, m: u32| {
         let last =
             NaiveDate::from_ymd_opt(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1)
-                .unwrap()
-                .pred_opt()
-                .unwrap()
+                .and_then(|first| first.pred_opt())
+                .expect("the first of the next month follows a valid date")
                 .day();
-        NaiveDate::from_ymd_opt(y, m, day.min(last)).unwrap()
+        NaiveDate::from_ymd_opt(y, m, day.min(last)).expect("a day clamped to the month's last")
     };
     let this = clamped(today.year(), today.month());
     if today >= this {
@@ -3518,9 +3603,13 @@ mod tests {
         let _ = db.conn().query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         let fat = on_disk(&scratch.0);
         // Folded first, as the hourly pass does: minute rows outlive the window
-        // until their hour is folded. Dated past the lateness allowance so the
-        // last hour counts as complete.
+        // until their hour is folded. Dated past the lateness allowance, and
+        // with a later row from a node removed afterwards, so the last hour
+        // counts as complete.
+        let later = node(&db, 2);
+        db.insert_metric(later, now + 2 * 3_600, &sample).unwrap();
         db.roll_up(now + 3 * 3_600, 1).unwrap();
+        db.delete_node(later).unwrap();
         db.prune(0).unwrap();
 
         let freed = db.vacuum().unwrap();
@@ -3857,12 +3946,11 @@ mod tests {
         assert_eq!(pings, 0, "ping_record has no foreign key to cascade through");
         assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 0);
         assert!(!db.all_traffic().contains_key(&id));
-        // Ticked in an editor opened before the delete: named, not a 500.
+        // Ticked in an editor opened before the delete: a sentence, not a 500.
         let gone = db.save_ping_task(&probe(vec![id])).unwrap_err();
-        let expected = format!("节点 {id} 不存在，可能已被删除");
         assert_eq!(
             gone.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()),
-            Some(expected.as_str()),
+            Some(Db::DELETED_TICKED),
             "{gone:#}"
         );
 
@@ -3975,9 +4063,18 @@ mod tests {
         let hour = (now - 3 * 3_600).div_euclid(3_600) * 3_600;
         db.conn().execute("INSERT INTO ping_record VALUES (?1, 999, ?2, 42)", params![id, hour]).unwrap();
         db.insert_metric(id, hour, &serde_json::json!({"cpu": 1.0})).unwrap();
+        // Still reporting: an hour folds once a later row is stored.
+        db.insert_metric(id, now - 60, &serde_json::json!({"cpu": 1.0})).unwrap();
         assert!(db.roll_up(now, 1).unwrap() > 0);
-        let span = Span { since: hour, step: 3_600, hourly: true };
-        assert_eq!(db.metrics(id, span).unwrap().len(), 1, "the hour is folded");
+        let folded: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM metric_hour WHERE node_id=?1 AND ts=?2",
+                params![id, hour],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(folded, 1, "the hour is folded");
     }
 
     /// Counted directly from the table rather than read back through
@@ -4162,10 +4259,69 @@ mod tests {
         assert!(db.reorder_nodes(&[a, b]).is_err(), "a node left out");
         assert!(db.reorder_nodes(&[a, b, 9999]).is_err(), "an id that is not a node");
         assert_eq!(order(), vec![c, a, b]);
-        // A node added afterwards goes to the end rather than wherever sort 0
+        // A node added afterwards goes first rather than wherever sort 0
         // places it.
         let d = node(&db, 1);
-        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b, d]);
+        assert_eq!(order(), vec![d, c, a, b]);
+    }
+
+    #[test]
+    fn a_node_entering_a_group_joins_its_block_and_leaves_the_group_order_alone() {
+        let db = db();
+        let ids: Vec<i64> = (0..6).map(|_| node(&db, 1)).collect();
+        let [hk1, hk2, jp, us, x, y] = ids[..] else { unreachable!() };
+        db.reorder_nodes(&ids).unwrap();
+        let group = |ids: &[i64], name: &str| {
+            let patch = NodePatch { group: Some(name.into()), ..Default::default() };
+            assert!(db.update_nodes(ids, &patch).unwrap());
+        };
+        let order = || db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>();
+        group(&[hk1, hk2], "港");
+        group(&[jp], "日");
+        group(&[us], "美");
+        assert_eq!(
+            order(),
+            vec![x, y, hk1, hk2, jp, us],
+            "a new group starts at the end, so its tab comes last"
+        );
+        db.reorder_nodes(&ids).unwrap();
+
+        // A new node from the top of the list, and two at once in list order.
+        let n = node(&db, 1);
+        assert_eq!(order()[0], n);
+        group(&[n], "港");
+        assert_eq!(order(), vec![hk1, hk2, n, jp, us, x, y]);
+        group(&[y, x], "日");
+        assert_eq!(order(), vec![hk1, hk2, n, jp, x, y, us]);
+
+        // Already in it, or a patch not touching the group: nothing moves.
+        db.reorder_nodes(&[n, hk1, hk2, jp, x, y, us]).unwrap();
+        group(&[n], "港");
+        let name = NodePatch { name: Some("m".into()), ..Default::default() };
+        assert!(db.update_node(n, &name).unwrap());
+        assert_eq!(order()[0], n);
+
+        // A whole group renamed keeps its place; part of one starts a new group
+        // at the end, so its tab comes last.
+        group(&[jp, x, y], "东京");
+        assert_eq!(order(), vec![n, hk1, hk2, jp, x, y, us]);
+        group(&[hk1], "澳");
+        assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+        // Leaving every group moves nothing.
+        group(&[jp], "");
+        assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+        // An unknown id still rolls the whole patch back, the move included.
+        let patch = NodePatch { group: Some("港".into()), ..Default::default() };
+        assert!(!db.update_nodes(&[us, 9999], &patch).unwrap());
+        assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+        // Created in a group, as the API allows: into its rows, not first.
+        let made = Node { name: "z".into(), group: "港".into(), ..Default::default() };
+        let z = db.create_node(&made, "token-z").unwrap();
+        assert_eq!(order(), vec![n, hk2, z, jp, x, y, us, hk1]);
+        assert_eq!(db.node(z).unwrap().unwrap().group, "港");
     }
 
     /// Themes draw probes in the order they first appear in the rows, so the rows
@@ -4242,6 +4398,10 @@ mod tests {
             .unwrap();
         }
         let end = start + 6 * 3_600;
+        // Another node still reporting after the six hours: an hour folds once
+        // a later row is stored.
+        let other = node(&db, 2);
+        db.insert_metric(other, end, &serde_json::json!({"cpu": 1.0})).unwrap();
 
         let compare = |step: i64| {
             let hourly = Span { since: start, step, hourly: true };
@@ -4335,6 +4495,75 @@ mod tests {
         db.roll_up(now, 1).unwrap();
         let span = Span { since: hour, step: 3_600, hourly: true };
         assert_eq!(db.metrics(1, span).unwrap().len(), 1, "the restored file folds and answers");
+    }
+
+    #[test]
+    fn a_clock_running_fast_leaves_no_gap_in_the_hourly_tier() {
+        // The hub restarts at `t` on a clock 8 hours fast, then NTP corrects
+        // it and the agents report for 12 hours, folded on the hour: once with
+        // ten hours of history before the restart, once on a fresh install.
+        let t = 472_224 * 3_600;
+        for history in [10, 0] {
+            let db = db();
+            let id = node(&db, 1);
+            let row = |ts: i64| db.insert_metric(id, ts, &serde_json::json!({"cpu": 5.0})).unwrap();
+            let watermark = || rolled(&db.conn()).unwrap();
+            (0..history * 60).for_each(|m| row(t - history * 3_600 + m * 60));
+            if history > 0 {
+                db.roll_up(t, 30).unwrap();
+            }
+            // On a fresh install this is the first pass, with no rows yet.
+            db.roll_up(t + 8 * 3_600, 30).unwrap();
+            assert!(watermark().is_none_or(|w| w <= t), "{history}: folded no hour ahead of the rows");
+            for m in 0..12 * 60 {
+                row(t + m * 60);
+                if m % 60 == 59 {
+                    db.roll_up(t + m * 60 + 60, 30).unwrap();
+                }
+            }
+            let since = t - history.min(3) * 3_600;
+            let wide = db.metrics(id, Span { since, step: 3_600, hourly: true }).unwrap();
+            let drawn: Vec<(i64, i64)> =
+                wide.iter().map(|p| (p["ts"].as_i64().unwrap(), p["minutes"].as_i64().unwrap())).collect();
+            let want: Vec<(i64, i64)> = (-history.min(3)..12).map(|h| (t + h * 3_600, 60)).collect();
+            assert_eq!(drawn, want, "{history}: every hour drawn whole");
+            let folded: i64 = db
+                .conn()
+                .query_row("SELECT count(*) FROM metric_hour WHERE ts >= ?1", [t], |r| r.get(0))
+                .unwrap();
+            assert_eq!(folded, 10, "{history}: the hours after the restart are in the tier");
+
+            // A clock far behind moves nothing back.
+            let held = watermark();
+            assert_eq!(db.roll_up(0, 30).unwrap(), 0);
+            assert_eq!(watermark(), held);
+        }
+    }
+
+    /// A fleet silent for months resumes in a step per stretch of empty hours,
+    /// not a transaction per hour it missed.
+    #[test]
+    fn a_long_silence_is_crossed_in_one_step() {
+        let db = db();
+        let id = node(&db, 1);
+        let t = 472_224 * 3_600;
+        (0..60).for_each(|m| {
+            db.insert_metric(id, t - 3_600 + m * 60, &serde_json::json!({"cpu": 1.0})).unwrap()
+        });
+        let back = t + 100 * 86_400;
+        (0..120).for_each(|m| db.insert_metric(id, back + m * 60, &serde_json::json!({"cpu": 2.0})).unwrap());
+        // The hour before the silence, the silence itself, the first hour back.
+        assert_eq!(db.roll_up(back + 2 * 3_600 + LATE, 365).unwrap(), 3);
+        let hours: Vec<i64> = db
+            .conn()
+            .prepare("SELECT ts FROM metric_hour ORDER BY ts")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(hours, [t - 3_600, back]);
+        assert_eq!(rolled(&db.conn()).unwrap(), Some(back + 3_600));
     }
 
     #[test]

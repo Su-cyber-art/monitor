@@ -175,13 +175,19 @@ mod tests {
         let old = node(&app, "old");
         let offline = node(&app, "offline");
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let mut agent = Agent::new(1, tx.clone());
+        let (tasks, mut task_rx) = tokio::sync::mpsc::channel(1);
+        let mut agent = Agent::new(1, tx.clone(), tasks);
         agent.can_upgrade = true;
         app.agents.write().unwrap().insert(ready, agent);
-        app.agents.write().unwrap().insert(old, Agent::new(2, tx));
+        app.agents.write().unwrap().insert(old, Agent::new(2, tx, tokio::sync::mpsc::channel(1).0));
+        // Repeated probe edits coalesce without occupying the command queue.
+        crate::agent_ws::push_ping_tasks(&app, Some(ready));
+        crate::agent_ws::push_ping_tasks(&app, Some(ready));
         let request = || Json(Request { ids: vec![ready, ready, old, offline], version: "1.3.1".into() });
         assert_eq!(start(Admin, State(app.clone()), request()).await.status(), StatusCode::OK);
         let command: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(task_rx.try_recv().is_ok(), "the probe refresh remains pending alongside the upgrade");
+        assert!(task_rx.try_recv().is_err(), "probe edits are coalesced");
         assert_eq!(command["method"], "agent.upgrade");
         assert_eq!(command["params"]["version"], "1.3.1");
         assert!(rx.try_recv().is_err());

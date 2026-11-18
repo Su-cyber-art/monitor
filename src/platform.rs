@@ -33,7 +33,7 @@ pub fn built_for(binary: &[u8], os: &str, arch: &str) -> bool {
                 return false;
             }
             let Some(offset) = binary.get(60..64) else { return false };
-            let offset = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+            let offset = u32::from_le_bytes(offset.try_into().expect("the PE offset is four bytes")) as usize;
             let Some(end) = offset.checked_add(26) else { return false };
             let Some(pe) = binary.get(offset..end) else { return false };
             pe.starts_with(b"PE\0\0")
